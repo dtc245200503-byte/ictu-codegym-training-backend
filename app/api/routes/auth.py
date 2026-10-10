@@ -1,14 +1,28 @@
+
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, verify_password
+from app.core.config import settings
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    hash_refresh_token,
+    verify_password,
+)
 from app.db.session import get_db
+from app.models.auth_session import AuthSession
 from app.models.user import User
-from app.schemas.auth import LoginRequest, LoginResponse, LoginUser
-
+from app.schemas.auth import (
+    LoginRequest,
+    LoginResponse,
+    LoginUser,
+    RefreshRequest,
+    RefreshResponse,
+    LogoutRequest,
+)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -58,7 +72,6 @@ def login(
                 detail="Tài khoản tạm thời bị khóa. Vui lòng thử lại sau 15 phút.",
             )
 
-        # The temporary lock has expired.
         user.locked_until = None
         user.failed_login_attempts = 0
         db.commit()
@@ -89,15 +102,24 @@ def login(
             detail="Tài khoản đã bị khóa hoặc vô hiệu hóa",
         )
 
-    # A successful login resets consecutive failures.
     user.failed_login_attempts = 0
     user.locked_until = None
+
+    refresh_token = create_refresh_token()
+    session = AuthSession(
+        user_id=user.id,
+        refresh_token_hash=hash_refresh_token(refresh_token),
+        expires_at=now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+
+    db.add(session)
     db.commit()
 
     access_token = create_access_token(subject=str(user.id))
 
     return LoginResponse(
         access_token=access_token,
+        refresh_token=refresh_token,
         token_type="bearer",
         user=LoginUser(
             id=user.id,
@@ -107,3 +129,80 @@ def login(
             roles=[role.code for role in user.roles],
         ),
     )
+
+@router.post("/refresh", response_model=RefreshResponse)
+def refresh_tokens(
+    request: RefreshRequest,
+    db: Session = Depends(get_db),
+):
+    now = utc_now()
+    token_hash = hash_refresh_token(request.refresh_token)
+
+    session = db.scalar(
+        select(AuthSession)
+        .where(AuthSession.refresh_token_hash == token_hash)
+        .with_for_update()
+    )
+
+    invalid_token = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Refresh token không hợp lệ hoặc đã hết hạn",
+    )
+
+    if session is None or session.revoked_at is not None:
+        raise invalid_token
+
+    if normalize_datetime(session.expires_at) <= now:
+        session.revoked_at = now
+        db.commit()
+        raise invalid_token
+
+    user = db.get(User, session.user_id)
+
+    if user is None or not user.is_active or user.is_locked:
+        session.revoked_at = now
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tài khoản đã bị khóa hoặc vô hiệu hóa",
+        )
+
+    new_refresh_token = create_refresh_token()
+
+    # Revoke the old refresh token before issuing the replacement.
+    session.revoked_at = now
+
+    new_session = AuthSession(
+        user_id=user.id,
+        refresh_token_hash=hash_refresh_token(new_refresh_token),
+        expires_at=now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+
+    db.add(new_session)
+    db.commit()
+
+    new_access_token = create_access_token(subject=str(user.id))
+
+    return RefreshResponse(
+        access_token=new_access_token,
+        refresh_token=new_refresh_token,
+        token_type="bearer",
+    )
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(
+    request: LogoutRequest,
+    db: Session = Depends(get_db),
+):
+    token_hash = hash_refresh_token(request.refresh_token)
+
+    session = db.scalar(
+        select(AuthSession).where(
+            AuthSession.refresh_token_hash == token_hash
+        )
+    )
+
+    if session is not None and session.revoked_at is None:
+        session.revoked_at = utc_now()
+        db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

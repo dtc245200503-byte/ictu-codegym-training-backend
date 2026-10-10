@@ -6,12 +6,6 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
-class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user: "LoginUser"
-
-
 class LoginUser(BaseModel):
     id: int
     username: str
@@ -20,4 +14,22 @@ class LoginUser(BaseModel):
     roles: list[str]
 
 
-LoginResponse.model_rebuild()
+class LoginResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user: LoginUser
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(min_length=1)
+
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str = Field(min_length=1)
