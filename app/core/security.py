@@ -54,3 +54,12 @@ def create_refresh_token() -> str:
 def hash_refresh_token(token: str) -> str:
     """Return the SHA-256 hash of a refresh token."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def create_password_reset_token() -> str:
+    """Create a cryptographically secure password reset token."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_password_reset_token(token: str) -> str:
+    """Return the SHA-256 hash of a password reset token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
