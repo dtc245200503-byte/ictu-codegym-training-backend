@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
+import hashlib
+import secrets
+
 import jwt
 from pwdlib import PasswordHash
 
@@ -43,3 +46,11 @@ def create_access_token(
         settings.JWT_SECRET_KEY,
         algorithm=settings.JWT_ALGORITHM,
     )
+def create_refresh_token() -> str:
+    """Create a cryptographically secure opaque refresh token."""
+    return secrets.token_urlsafe(48)
+
+
+def hash_refresh_token(token: str) -> str:
+    """Return the SHA-256 hash of a refresh token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
