@@ -9,11 +9,15 @@ from app.core.config import settings
 from app.core.security import (
     create_access_token,
     create_refresh_token,
+    create_password_reset_token,
+    hash_password_reset_token,
     hash_refresh_token,
+    hash_password,
     verify_password,
 )
 from app.db.session import get_db
 from app.models.auth_session import AuthSession
+from app.models.password_reset_token import PasswordResetToken
 from app.models.user import User
 from app.schemas.auth import (
     LoginRequest,
@@ -22,7 +26,11 @@ from app.schemas.auth import (
     RefreshRequest,
     RefreshResponse,
     LogoutRequest,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
+    ResetPasswordRequest,
 )
+from app.services.email_service import send_password_reset_email
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -206,3 +214,146 @@ def logout(
         db.commit()
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+@router.post("/forgot-password", response_model=ForgotPasswordResponse)
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    generic_message = (
+        "Nếu email tồn tại trong hệ thống, "
+        "hướng dẫn đặt lại mật khẩu sẽ được gửi đến email đó."
+    )
+
+    user = db.scalar(
+        select(User).where(User.email == str(request.email))
+    )
+
+    # Always return the same response for an unknown email.
+    if user is None:
+        return ForgotPasswordResponse(message=generic_message)
+
+    now = utc_now()
+    raw_token = create_password_reset_token()
+
+    reset_token = PasswordResetToken(
+        user_id=user.id,
+        token_hash=hash_password_reset_token(raw_token),
+        expires_at=now + timedelta(
+            minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
+        ),
+    )
+
+    try:
+        # Invalidate older unused reset tokens for this user.
+        db.query(PasswordResetToken).filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.used_at.is_(None),
+        ).update(
+            {PasswordResetToken.used_at: now},
+            synchronize_session=False,
+        )
+
+        db.add(reset_token)
+        db.commit()
+
+        reset_link = (
+            f"{settings.FRONTEND_RESET_PASSWORD_URL}"
+            f"?token={raw_token}"
+        )
+
+        await send_password_reset_email(user.email, reset_link)
+    except Exception:
+        db.rollback()
+
+        # Invalidate the token if email delivery fails.
+        try:
+            failed_token = db.scalar(
+                select(PasswordResetToken).where(
+                    PasswordResetToken.token_hash
+                    == hash_password_reset_token(raw_token)
+                )
+            )
+
+            if (
+                failed_token is not None
+                and failed_token.used_at is None
+            ):
+                failed_token.used_at = utc_now()
+                db.commit()
+
+        except Exception:
+            db.rollback()
+
+        # Keep the response identical for known and unknown emails.
+        return ForgotPasswordResponse(message=generic_message)
+
+    return ForgotPasswordResponse(message=generic_message)
+
+
+@router.post("/reset-password")
+def reset_password(
+    request: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    now = utc_now()
+    token_hash = hash_password_reset_token(request.token)
+
+    reset_token = db.scalar(
+        select(PasswordResetToken)
+        .where(PasswordResetToken.token_hash == token_hash)
+        .with_for_update()
+    )
+
+    invalid_token = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Token không hợp lệ, đã hết hạn hoặc đã được sử dụng.",
+    )
+
+    if reset_token is None or reset_token.used_at is not None:
+        raise invalid_token
+
+    if normalize_datetime(reset_token.expires_at) <= now:
+        raise invalid_token
+
+    user = db.get(User, reset_token.user_id)
+
+    if user is None:
+        raise invalid_token
+
+    try:
+        user.hashed_password = hash_password(request.new_password)
+        user.failed_login_attempts = 0
+        user.locked_until = None
+
+        reset_token.used_at = now
+
+        # Revoke all refresh sessions for this user.
+        db.query(AuthSession).filter(
+            AuthSession.user_id == user.id,
+            AuthSession.revoked_at.is_(None),
+        ).update(
+            {AuthSession.revoked_at: now},
+            synchronize_session=False,
+        )
+
+        # Invalidate other outstanding reset tokens.
+        db.query(PasswordResetToken).filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.id != reset_token.id,
+            PasswordResetToken.used_at.is_(None),
+        ).update(
+            {PasswordResetToken.used_at: now},
+            synchronize_session=False,
+        )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Không thể đặt lại mật khẩu lúc này.",
+        )
+
+    return {"message": "Đặt lại mật khẩu thành công."}
