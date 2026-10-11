@@ -1,8 +1,9 @@
 
 from datetime import datetime, timedelta, timezone
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -36,6 +37,7 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 MAX_FAILED_ATTEMPTS = 5
 LOCK_DURATION_MINUTES = 15
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -56,7 +58,12 @@ def login(
 ):
     user = db.scalar(
         select(User)
-        .where(User.email == str(credentials.email))
+        .where(
+            or_(
+                func.lower(User.email) == credentials.identifier.strip().lower(),
+                func.lower(User.username) == credentials.identifier.strip().lower(),
+            )
+        )
         .with_for_update()
     )
 
@@ -135,6 +142,7 @@ def login(
             email=user.email,
             full_name=user.full_name,
             roles=[role.code for role in user.roles],
+            must_change_password=user.must_change_password,
         ),
     )
 
@@ -226,7 +234,7 @@ async def forgot_password(
     )
 
     user = db.scalar(
-        select(User).where(User.email == str(request.email))
+        select(User).where(func.lower(User.email) == str(request.email).lower())
     )
 
     # Always return the same response for an unknown email.
@@ -258,13 +266,16 @@ async def forgot_password(
         db.commit()
 
         reset_link = (
-            f"{settings.FRONTEND_RESET_PASSWORD_URL}"
+            f"{settings.FRONTEND_URL.rstrip('/')}/reset-password"
             f"?token={raw_token}"
         )
 
         await send_password_reset_email(user.email, reset_link)
     except Exception:
         db.rollback()
+        logger.exception(
+            "Failed to send a password reset email for user %s", user.id
+        )
 
         # Invalidate the token if email delivery fails.
         try:
@@ -323,6 +334,7 @@ def reset_password(
 
     try:
         user.hashed_password = hash_password(request.new_password)
+        user.must_change_password = False
         user.failed_login_attempts = 0
         user.locked_until = None
 

@@ -67,6 +67,34 @@ def test_login_success_returns_access_token(client, test_db):
     assert payload["type"] == "access"
 
 
+def test_login_accepts_username_in_identifier_and_legacy_username_field(client, test_db):
+    user = create_test_user(test_db, username="ictu.admin")
+
+    for payload in (
+        {"identifier": user.username, "password": "CorrectPassword123!"},
+        {"username": user.username, "password": "CorrectPassword123!"},
+        {"email": user.username, "password": "CorrectPassword123!"},
+    ):
+        response = client.post("/api/auth/login", json=payload)
+        assert response.status_code == 200
+        assert response.json()["access_token"]
+        assert response.json()["token_type"] == "bearer"
+
+
+def test_login_is_case_insensitive_for_username_and_email(client, test_db):
+    user = create_test_user(test_db, username="ICTU.Admin")
+
+    response = client.post(
+        "/api/auth/login",
+        json={
+            "identifier": user.username.lower(),
+            "password": "CorrectPassword123!",
+        },
+    )
+
+    assert response.status_code == 200
+
+
 def test_login_rejects_wrong_password(client, test_db):
     create_test_user(test_db)
 

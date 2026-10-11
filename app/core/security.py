@@ -10,6 +10,7 @@ from app.core.config import settings
 
 
 password_hash = PasswordHash.recommended()
+DEFAULT_ACCOUNT_PASSWORD = "123456"
 
 
 def hash_password(password: str) -> str:

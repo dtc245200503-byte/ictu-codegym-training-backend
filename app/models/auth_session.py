@@ -25,18 +25,18 @@ class AuthSession(Base):
     )
 
     expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        DateTime(),
         nullable=False,
     )
 
     revoked_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        DateTime(),
         nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
+        DateTime(),
+        server_default=func.current_timestamp(),
         nullable=False,
     )
 
