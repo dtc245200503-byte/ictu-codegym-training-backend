@@ -5,7 +5,7 @@ from sqlalchemy import text
 from app.database import engine, Base
 from app.migrations import ensure_consultation_timestamp_precision
 from app.migrations import ensure_lead_columns, seed_lead_permission
-from app.migrations import ensure_lead_assignment_columns
+from app.migrations import ensure_lead_assignment_columns, ensure_lead_care_schema
 from app.migrations import ensure_profile_columns, ensure_training_program_columns, seed_training_program_permission
 import app.models  # Import toàn bộ models để SQLAlchemy nhận diện các định nghĩa bảng
 
@@ -17,6 +17,7 @@ from app.routers.users import router as users_router
 from app.routers.me import router as me_router
 from app.routers.consultations import router as consultations_router
 from app.routers.leads import router as leads_router
+from app.routers.lead_care import router as lead_care_router
 from app.routers.classes import router as classes_router
 from app.routers.subject_lessons import router as subject_lessons_router
 from app.routers.role_permissions import router as role_permissions_router
@@ -35,6 +36,7 @@ Base.metadata.create_all(bind=engine)
 ensure_consultation_timestamp_precision(engine)
 ensure_lead_columns(engine)
 ensure_lead_assignment_columns(engine)
+ensure_lead_care_schema(engine)
 seed_lead_permission()
 ensure_profile_columns(engine)
 ensure_training_program_columns(engine)
@@ -77,6 +79,7 @@ app.include_router(users_router)
 app.include_router(me_router)
 app.include_router(consultations_router)
 app.include_router(leads_router)
+app.include_router(lead_care_router)
 app.include_router(classes_router)
 app.include_router(subject_lessons_router)
 app.include_router(role_permissions_router)

@@ -53,6 +53,8 @@ class LeadResponse(BaseModel):
     duplicate_count: int
     assignee_id: int | None
     assignee_name: str | None
+    next_callback_at: datetime | None = None
+    callback_overdue: bool = False
 
 
 class LeadListResponse(BaseModel):

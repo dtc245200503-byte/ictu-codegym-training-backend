@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from datetime import date, datetime, time, timedelta
 import re
+from typing import Literal
+from app.crud import consultations
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from app.core.auth import get_current_user
@@ -36,11 +38,18 @@ def require_training_manager(user: User = Depends(get_current_user), db: Session
 def list_leads(search: str = Query("", max_length=100), source: str = Query("", max_length=100),
                page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
                assignee_id: int | None = Query(None, ge=0), status: LeadStatus | None = Query(None),
+               callback_status: Literal["overdue", "upcoming", "none"] | None = Query(None),
                date_from: date | None = Query(None), date_to: date | None = Query(None),
                user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Ngày bắt đầu không được sau ngày kết thúc.")
     query = active_leads(db, user)
+    if callback_status == "overdue":
+        query = query.filter(ConsultationLead.next_callback_at < consultations.utcnow())
+    elif callback_status == "upcoming":
+        query = query.filter(ConsultationLead.next_callback_at >= consultations.utcnow())
+    elif callback_status == "none":
+        query = query.filter(ConsultationLead.next_callback_at.is_(None))
     if status is not None:
         query = query.filter(ConsultationLead.status == status)
     # Stored timestamps are UTC; calendar dates in this Vietnamese UI use UTC+7.

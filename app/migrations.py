@@ -1,6 +1,21 @@
 from sqlalchemy import inspect, text
 
 
+def ensure_lead_care_schema(engine):
+    """Preserve existing leads; add a nullable callback and its lookup index."""
+    from app.models.lead_care import LeadCareLog
+    columns = {column["name"] for column in inspect(engine).get_columns("consultation_leads")}
+    if "next_callback_at" not in columns:
+        sql_type = "DATETIME(6)" if engine.dialect.name == "mysql" else "DATETIME"
+        with engine.begin() as connection:
+            connection.execute(text(f"ALTER TABLE consultation_leads ADD COLUMN next_callback_at {sql_type} NULL"))
+    indexes = inspect(engine).get_indexes("consultation_leads")
+    if not any(item["column_names"] == ["next_callback_at"] for item in indexes):
+        with engine.begin() as connection:
+            connection.execute(text("CREATE INDEX ix_consultation_leads_next_callback_at ON consultation_leads (next_callback_at)"))
+    LeadCareLog.__table__.create(bind=engine, checkfirst=True)
+
+
 def ensure_class_assignment_schema(engine):
     """Add subject-level assignments; migrate legacy class teachers only once."""
     from app.models.subject import ClassSubjectAssistant

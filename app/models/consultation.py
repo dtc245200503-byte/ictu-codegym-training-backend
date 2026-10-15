@@ -21,6 +21,7 @@ class ConsultationLead(Base):
     deleted_at = Column(PRECISE_DATETIME, nullable=True)
     status = Column(String(20), nullable=False, default="new", index=True)
     created_at = Column(PRECISE_DATETIME, nullable=False)
+    next_callback_at = Column(PRECISE_DATETIME, nullable=True, index=True)
     assignee_id = Column(Integer, ForeignKey("users.user_id"), nullable=True, index=True)
 
 

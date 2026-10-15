@@ -13,6 +13,7 @@ from app.models.user import User
 from app.models.user_role import UserRole
 from app.models.role_permission import RolePermission
 from app.models.lead_assignment import LeadAssignmentHistory
+from app.models.lead_care import LeadCareLog
 from app.migrations import ensure_lead_columns, seed_lead_permission
 
 
@@ -38,6 +39,7 @@ def ctx(monkeypatch):
     with SessionLocal() as db:
         db.query(ConsultationChallenge).filter(ConsultationChallenge.client_key==consultations.fingerprint('client:'+host)).delete(synchronize_session=False)
         lead_ids = [row[0] for row in db.query(ConsultationLead.lead_id).filter(ConsultationLead.full_name.like(prefix+'%'))]
+        db.query(LeadCareLog).filter(LeadCareLog.lead_id.in_(lead_ids)).delete(synchronize_session=False)
         db.query(LeadAssignmentHistory).filter(LeadAssignmentHistory.lead_id.in_(lead_ids)).delete(synchronize_session=False)
         db.query(ConsultationLead).filter(ConsultationLead.full_name.like(prefix+'%')).delete(synchronize_session=False)
         keys = [consultations.fingerprint(action+':'+host) for action in ['challenge','submission']]+[consultations.fingerprint('phone:'+p) for p in phones]

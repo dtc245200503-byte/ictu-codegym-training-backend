@@ -1,4 +1,6 @@
 from collections import Counter
+from datetime import timezone
+from app.crud import consultations
 from fastapi import HTTPException
 from sqlalchemy import func
 from app.core.permissions import user_has_permission
@@ -65,10 +67,13 @@ def serialize_leads(db, leads, viewer=None):
     counts = Counter(canonical_phone(row[0]) for row in active_leads(db, viewer).with_entities(ConsultationLead.phone).filter(
         func.trim(ConsultationLead.phone).in_(variants)).all())
     users = {user.user_id: user.full_name for user in db.query(User).filter(User.user_id.in_({lead.assignee_id for lead in leads if lead.assignee_id}))}
+    now = consultations.utcnow()
     return [{"lead_id": lead.lead_id, "full_name": lead.full_name, "phone": lead.phone, "email": lead.email,
         "source": lead.source, "interest": lead.interest, "message": lead.message, "status": lead.status,
         "created_at": lead.created_at, "duplicate_count": max(0, counts[canonical_phone(lead.phone)] - 1),
-        "assignee_id": lead.assignee_id, "assignee_name": users.get(lead.assignee_id)} for lead in leads]
+        "assignee_id": lead.assignee_id, "assignee_name": users.get(lead.assignee_id),
+        "next_callback_at": lead.next_callback_at.replace(tzinfo=timezone.utc) if lead.next_callback_at else None,
+        "callback_overdue": lead.next_callback_at is not None and lead.next_callback_at < now} for lead in leads]
 
 
 def save_lead(db, data, lead_id=None, viewer=None):
