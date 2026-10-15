@@ -17,18 +17,21 @@ from app.routers.users import router as users_router
 from app.routers.me import router as me_router
 from app.routers.consultations import router as consultations_router
 from app.routers.leads import router as leads_router
+from app.routers.classes import router as classes_router
 from app.routers.subject_lessons import router as subject_lessons_router
 from app.routers.role_permissions import router as role_permissions_router
 from app.routers import curriculum
 from app.routers.training_programs import router as training_program_router
 from app.routers.subjects import router as subject_router
-from app.migrations import ensure_subject_columns, seed_subject_permission
-from app.routers.subjects import router as subject_router
-from app.migrations import ensure_subject_columns, seed_subject_permission
+from app.migrations import (
+    ensure_subject_columns, seed_subject_permission,
+    ensure_class_assignment_schema, seed_class_permissions_and_roles
+)
 
 
-# 1. Tự động khởi tạo/tạo các bảng chưa có trong Database MySQL (bao gồm bảng subjects)
+# 1. Tự động khởi tạo/tạo các bảng chưa có trong Database (bao gồm bảng subjects, class_subjects, etc.)
 Base.metadata.create_all(bind=engine)
+
 ensure_consultation_timestamp_precision(engine)
 ensure_lead_columns(engine)
 ensure_lead_assignment_columns(engine)
@@ -38,8 +41,11 @@ ensure_training_program_columns(engine)
 seed_training_program_permission()
 ensure_subject_columns(engine)
 seed_subject_permission()
-ensure_subject_columns(engine)
-seed_subject_permission()
+ensure_class_assignment_schema(engine)
+seed_class_permissions_and_roles()
+
+
+
 
 
 # 2. Khởi tạo FastAPI application
@@ -71,6 +77,7 @@ app.include_router(users_router)
 app.include_router(me_router)
 app.include_router(consultations_router)
 app.include_router(leads_router)
+app.include_router(classes_router)
 app.include_router(subject_lessons_router)
 app.include_router(role_permissions_router)
 app.include_router(curriculum.router)  # Router chương trình đào tạo

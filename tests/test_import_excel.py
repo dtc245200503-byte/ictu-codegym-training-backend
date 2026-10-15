@@ -1,6 +1,7 @@
 import io
 import openpyxl
 import pytest
+import uuid
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -307,4 +308,67 @@ def test_direct_import_excel_endpoint(admin_token):
     db.query(User).filter(User.user_id == imported_user.user_id).delete()
     db.commit()
     db.close()
+
+
+@pytest.mark.parametrize('endpoint', ['preview', ''])
+def test_import_rejects_oversized_upload(admin_token, endpoint):
+    response = client.post(
+        '/api/users/import-excel' + ('/' + endpoint if endpoint else ''),
+        headers={'Authorization': f'Bearer {admin_token}'},
+        files={'file': ('large.xlsx', b'0' * (10 * 1024 * 1024 + 1))},
+    )
+    assert response.status_code == 413
+    assert '10 MB' in response.json()['detail']
+
+
+@pytest.mark.parametrize('endpoint', ['preview', ''])
+def test_import_rejects_more_than_5000_rows(admin_token, endpoint):
+    data = create_excel_bytes(['HoTen', 'Email', 'VaiTro'], [
+        [f'Người dùng {index}', f'limit{index}@example.com', 'STUDENT'] for index in range(5001)
+    ])
+    response = client.post(
+        '/api/users/import-excel' + ('/' + endpoint if endpoint else ''),
+        headers={'Authorization': f'Bearer {admin_token}'}, files={'file': ('large.xlsx', data)},
+    )
+    assert response.status_code == 400
+    assert '5.000' in response.json()['detail']
+
+
+@pytest.mark.parametrize('count', [0, 101])
+def test_confirm_requires_bounded_batches(admin_token, count):
+    response = client.post('/api/users/import-excel/confirm',
+        headers={'Authorization': f'Bearer {admin_token}'}, json={'users': [
+            {'row_index': index + 2, 'full_name': 'Batch User', 'email': f'batch{index}@example.com', 'role_id': 3}
+            for index in range(count)
+        ]})
+    assert response.status_code == 422
+
+
+def test_direct_import_multiple_batches_and_case_insensitive_retry(admin_token):
+    prefix = 'bulk_' + uuid.uuid4().hex[:12]
+    headers = {'Authorization': f'Bearer {admin_token}'}
+    rows = [[f'Người dùng {index}', f'{prefix}_{index}@example.com', 'STUDENT'] for index in range(101)]
+    contents = create_excel_bytes(['HoTen', 'Email', 'VaiTro'], rows)
+    try:
+        response = client.post('/api/users/import-excel', headers=headers, files={'file': ('USERS.XLSX', contents)})
+        assert response.status_code == 200
+        assert response.json()['success_count'] == 101
+        assert response.json()['failed_count'] == 0
+        rows[0][1] = rows[0][1].upper()
+        retry = client.post('/api/users/import-excel/preview', headers=headers,
+            files={'file': ('retry.xlsx', create_excel_bytes(['HoTen', 'Email', 'VaiTro'], rows))})
+        assert retry.json()['valid_count'] == 0
+        assert retry.json()['invalid_count'] == 101
+        assert 'đã tồn tại' in retry.json()['rows'][0]['errors'][0]
+        confirm = client.post('/api/users/import-excel/confirm', headers=headers, json={'users': [
+            {'row_index': 2, 'full_name': 'Không tạo lại', 'email': rows[0][1], 'role_id': 3}
+        ]})
+        assert confirm.json()['failed_count'] == 1
+        assert confirm.json()['success_count'] == 0
+    finally:
+        with SessionLocal() as db:
+            ids = [user.user_id for user in db.query(User).filter(User.email.like(prefix + '%')).all()]
+            db.query(UserRole).filter(UserRole.user_id.in_(ids)).delete(synchronize_session=False)
+            db.query(User).filter(User.user_id.in_(ids)).delete(synchronize_session=False)
+            db.commit()
 

@@ -16,7 +16,7 @@ from fastapi import (
     UploadFile,
     status
 )
-from sqlalchemy import or_, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from app.core.email import send_new_account_email
@@ -559,7 +559,13 @@ ROLE_NAME_MAP = {
     "BAN QUAN LY": (8, "Ban quản lý", "MANAGEMENT"),
     "BAN GIÁM HIỆU": (8, "Ban quản lý", "MANAGEMENT"),
     "BAN GIAM HIEU": (8, "Ban quản lý", "MANAGEMENT"),
+    # ASSISTANT
+    "ASSISTANT": (9, "Trợ giảng", "ASSISTANT"),
+    "TRỢ GIẢNG": (9, "Trợ giảng", "ASSISTANT"),
+    "TRO GIANG": (9, "Trợ giảng", "ASSISTANT"),
+    "TA": (9, "Trợ giảng", "ASSISTANT"),
 }
+
 
 
 def resolve_role_info(role_raw: str, db: Session):
@@ -569,6 +575,9 @@ def resolve_role_info(role_raw: str, db: Session):
 
     clean_upper = clean.upper()
     if clean_upper in ROLE_NAME_MAP:
+        if ROLE_NAME_MAP[clean_upper][2] == "ASSISTANT":
+            assistant = db.query(Role).filter(Role.role_name.in_(["ASSISTANT", "TA"])).order_by(Role.role_id).first()
+            return (assistant.role_id, "Trợ giảng", assistant.role_name) if assistant else None
         return ROLE_NAME_MAP[clean_upper]
 
     if clean.isdigit():
@@ -601,6 +610,29 @@ def find_column(df_columns, candidates):
 
 
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+MAX_IMPORT_BYTES = 10 * 1024 * 1024
+MAX_IMPORT_ROWS = 5000
+IMPORT_BATCH_SIZE = 100
+
+
+def read_import_file(file: UploadFile) -> pd.DataFrame:
+    try:
+        if not (file.filename or "").lower().endswith((".xlsx", ".xls")):
+            raise HTTPException(status_code=400, detail="Tệp không đúng định dạng Excel (.xlsx, .xls)")
+        contents = file.file.read(MAX_IMPORT_BYTES + 1)
+        if len(contents) > MAX_IMPORT_BYTES:
+            raise HTTPException(status_code=413, detail="Tệp vượt quá 10 MB. Vui lòng chia thành các tệp nhỏ hơn.")
+        try:
+            df = pd.read_excel(io.BytesIO(contents), dtype=str, nrows=MAX_IMPORT_ROWS + 1)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Không thể đọc nội dung tệp Excel. Vui lòng kiểm tra định dạng tệp.")
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Tệp Excel không chứa dữ liệu dòng nào")
+        if len(df) > MAX_IMPORT_ROWS:
+            raise HTTPException(status_code=400, detail="Tệp vượt quá 5.000 dòng. Vui lòng chia thành nhiều tệp để nhập.")
+        return df
+    finally:
+        file.file.close()
 
 
 @router.get("/import-excel/template")
@@ -683,16 +715,21 @@ def parse_and_validate_excel_rows(df: pd.DataFrame, db: Session):
             detail=f"Thiếu cột bắt buộc trong tệp Excel: {', '.join(missing)}"
         )
 
-    existing_db_emails = {
-        email.lower() for (email,) in db.query(User.email).all() if email
-    }
-
     # Count email occurrences in excel to detect duplicates
     email_counts = {}
     for _, row in df.iterrows():
         raw_e = str(row[col_email]).strip().lower() if pd.notna(row[col_email]) else ""
         if raw_e:
             email_counts[raw_e] = email_counts.get(raw_e, 0) + 1
+
+    # Query only emails in this upload, in bounded groups instead of loading all users.
+    existing_db_emails = set()
+    emails = list(email_counts)
+    for offset in range(0, len(emails), 500):
+        existing_db_emails.update(email.lower() for (email,) in db.query(User.email).filter(
+            func.lower(User.email).in_(emails[offset:offset + 500])
+        ).all())
+    role_cache = {}
 
     parsed_rows = []
     seen_file_emails = set()
@@ -702,7 +739,7 @@ def parse_and_validate_excel_rows(df: pd.DataFrame, db: Session):
         errors = []
 
         raw_name = str(row[col_name]).strip() if pd.notna(row[col_name]) else ""
-        raw_email = str(row[col_email]).strip() if pd.notna(row[col_email]) else ""
+        raw_email = str(row[col_email]).strip().lower() if pd.notna(row[col_email]) else ""
         raw_phone = str(row[col_phone]).strip() if col_phone and pd.notna(row[col_phone]) else ""
         raw_role = str(row[col_role]).strip() if pd.notna(row[col_role]) else ""
 
@@ -717,7 +754,9 @@ def parse_and_validate_excel_rows(df: pd.DataFrame, db: Session):
             errors.append("Thiếu Email")
         else:
             email_lower = raw_email.lower()
-            if not EMAIL_REGEX.match(raw_email):
+            if len(raw_email) > 100:
+                errors.append("Email vượt quá 100 ký tự")
+            elif not EMAIL_REGEX.match(raw_email):
                 errors.append("Email không đúng định dạng")
             elif email_lower in existing_db_emails:
                 errors.append("Email đã tồn tại trong hệ thống")
@@ -748,7 +787,10 @@ def parse_and_validate_excel_rows(df: pd.DataFrame, db: Session):
         if not raw_role:
             errors.append("Thiếu Vai trò")
         else:
-            role_info = resolve_role_info(raw_role, db)
+            role_key = raw_role.upper()
+            if role_key not in role_cache:
+                role_cache[role_key] = resolve_role_info(raw_role, db)
+            role_info = role_cache[role_key]
             if not role_info:
                 errors.append(
                     "Vai trò không hợp lệ (hỗ trợ: Học viên, Giảng viên, Quản trị viên, Quản lý đào tạo, Kế toán, Tuyển sinh, Giáo vụ, Ban quản lý)"
@@ -780,31 +822,12 @@ def parse_and_validate_excel_rows(df: pd.DataFrame, db: Session):
 
 
 @router.post("/import-excel/preview", response_model=ImportPreviewResponse)
-async def preview_users_from_excel(
+def preview_users_from_excel(
     file: UploadFile = File(...),
     current_user: User = Depends(require_permission("USER_MANAGE")),
     db: Session = Depends(get_db)
 ):
-    if not file.filename.endswith((".xlsx", ".xls")):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tệp không đúng định dạng Excel (.xlsx, .xls)"
-        )
-
-    contents = await file.read()
-    try:
-        df = pd.read_excel(io.BytesIO(contents), dtype=str)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Không thể đọc nội dung tệp Excel. Vui lòng kiểm tra định dạng tệp."
-        )
-
-    if df.empty:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tệp Excel không chứa dữ liệu dòng nào"
-        )
+    df = read_import_file(file)
 
     parsed_rows, valid_count, invalid_count = parse_and_validate_excel_rows(df, db)
 
@@ -829,7 +852,7 @@ def confirm_import_users(
 
     for item in payload.users:
         # Kiểm tra trùng email trong DB tại thời điểm nhập
-        existing_email = db.query(User).filter(User.email == item.email).first()
+        existing_email = db.query(User).filter(func.lower(User.email) == item.email.lower()).first()
         if existing_email:
             failed_count += 1
             errors.append(f"Dòng {item.row_index}: Email '{item.email}' đã tồn tại trong hệ thống")
@@ -844,7 +867,7 @@ def confirm_import_users(
 
         # Tự sinh username an toàn từ email
         base_username = item.email.split("@")[0].strip().lower()
-        base_username = re.sub(r"[^a-zA-Z0-9_]", "_", base_username) or "user"
+        base_username = (re.sub(r"[^a-zA-Z0-9_]", "_", base_username) or "user")[:40]
         username = base_username
         suffix = 1
         while db.query(User).filter(User.username == username).first():
@@ -891,31 +914,12 @@ def confirm_import_users(
 
 
 @router.post("/import-excel", response_model=ImportSummaryResponse)
-async def import_users_from_excel(
+def import_users_from_excel(
     file: UploadFile = File(...),
     current_user: User = Depends(require_permission("USER_MANAGE")),
     db: Session = Depends(get_db)
 ):
-    if not file.filename.endswith((".xlsx", ".xls")):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tệp không đúng định dạng Excel (.xlsx, .xls)"
-        )
-
-    contents = await file.read()
-    try:
-        df = pd.read_excel(io.BytesIO(contents), dtype=str)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Không thể đọc nội dung tệp Excel"
-        )
-
-    if df.empty:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tệp Excel không chứa dữ liệu dòng nào"
-        )
+    df = read_import_file(file)
 
     parsed_rows, _, _ = parse_and_validate_excel_rows(df, db)
 
@@ -937,21 +941,20 @@ async def import_users_from_excel(
         if not r.is_valid
     ]
 
-    confirm_res = confirm_import_users(
-        payload=ConfirmImportRequest(users=valid_items),
-        current_user=current_user,
-        db=db
-    )
-
-    all_errors = invalid_row_errors + confirm_res.errors
+    results = [confirm_import_users(
+        payload=ConfirmImportRequest(users=valid_items[offset:offset + IMPORT_BATCH_SIZE]),
+        current_user=current_user, db=db
+    ) for offset in range(0, len(valid_items), IMPORT_BATCH_SIZE)]
+    success_count = sum(result.success_count for result in results)
+    all_errors = invalid_row_errors + [error for result in results for error in result.errors]
     total_rows = len(parsed_rows)
-    failed_count = len(parsed_rows) - confirm_res.success_count
+    failed_count = len(parsed_rows) - success_count
 
     return ImportSummaryResponse(
         message="Nhập dữ liệu hoàn tất",
         total_rows=total_rows,
-        success_count=confirm_res.success_count,
+        success_count=success_count,
         failed_count=failed_count,
         errors=all_errors,
-        summary_text=f"Tổng số: {total_rows} | Thành công: {confirm_res.success_count} | Bỏ qua: {failed_count}"
+        summary_text=f"Tổng số: {total_rows} | Thành công: {success_count} | Bỏ qua: {failed_count}"
     )

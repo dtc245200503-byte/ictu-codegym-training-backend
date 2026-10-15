@@ -3,6 +3,7 @@ from secrets import compare_digest
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -247,14 +248,14 @@ async def forgot_password(
 ):
     # 1. Tìm user theo email
     user = db.query(User).filter(
-        User.email == request.email
+        func.lower(User.email) == request.email.strip().lower()
     ).first()
 
-    # Không tiết lộ email có tồn tại hay không
     if user is None:
-        return {
-            "message": "Nếu email tồn tại, liên kết đặt lại mật khẩu đã được gửi."
-        }
+        raise HTTPException(
+            status_code=404,
+            detail="Email không tồn tại trong hệ thống. Vui lòng kiểm tra lại."
+        )
 
     # 2. Tạo token reset mật khẩu
     token = create_password_reset_token()
@@ -280,7 +281,7 @@ async def forgot_password(
     )
 
     return {
-        "message": "Nếu email tồn tại, liên kết đặt lại mật khẩu đã được gửi."
+        "message": "Đã gửi liên kết đặt lại mật khẩu đến email của bạn."
     }
 
 

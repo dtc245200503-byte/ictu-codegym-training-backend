@@ -51,7 +51,7 @@ def test_forgot_email_link_resets_password_and_allows_login(reset_context, monke
         sent.append(kwargs)
     monkeypatch.setattr('app.routers.auth.send_reset_password_email', capture_email)
     client = reset_context['client']
-    response = client.post('/api/auth/forgot-password', json={'email': reset_context['email']})
+    response = client.post('/api/auth/forgot-password', json={'email': ' ' + reset_context['email'].upper() + ' '})
     assert response.status_code == 200 and len(sent) == 1
     assert sent[0]['email'] == reset_context['email']
     token = parse_qs(urlparse(sent[0]['reset_link']).query)['token'][0]
@@ -142,6 +142,24 @@ def test_unknown_email_does_not_send_email_or_create_token(reset_context, monkey
     with SessionLocal() as db:
         before = db.query(PasswordResetToken).count()
     response = reset_context['client'].post('/api/auth/forgot-password', json={'email': 'missing_' + uuid.uuid4().hex + '@example.com'})
-    assert response.status_code == 200 and 'Nếu email tồn tại' in response.json()['message']
+    assert response.status_code == 404 and 'Email không tồn tại' in response.json()['detail']
     with SessionLocal() as db:
         assert db.query(PasswordResetToken).count() == before
+
+
+def test_change_password_keeps_current_session_and_rejects_wrong_confirmation(reset_context):
+    client = reset_context['client']
+    login = client.post('/api/auth/login', json={
+        'email': reset_context['email'], 'password': 'OldPassword123'
+    }).json()
+    headers = {'Authorization': 'Bearer ' + login['access_token']}
+    payload = {'current_password': 'OldPassword123', 'new_password': 'NewPassword456!',
+               'confirm_password': 'WrongPassword789!', 'refresh_token': login['refresh_token']}
+    assert client.post('/api/auth/change-password', headers=headers, json=payload).status_code == 422
+    payload['confirm_password'] = payload['new_password']
+    response = client.post('/api/auth/change-password', headers=headers, json=payload)
+    assert response.status_code == 200
+    assert client.post('/api/auth/refresh', json={'refresh_token': login['refresh_token']}).status_code == 200
+    assert client.post('/api/auth/login', json={
+        'email': reset_context['email'], 'password': payload['new_password']
+    }).status_code == 200

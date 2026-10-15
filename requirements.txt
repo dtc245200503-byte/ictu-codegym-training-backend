@@ -11,5 +11,6 @@ httpx
 email-validator
 pandas
 openpyxl
+xlrd
 python-multipart
 Pillow

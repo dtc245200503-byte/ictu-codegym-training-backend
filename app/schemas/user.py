@@ -52,7 +52,7 @@ class ImportConfirmUserItem(BaseModel):
 
 
 class ConfirmImportRequest(BaseModel):
-    users: list[ImportConfirmUserItem]
+    users: list[ImportConfirmUserItem] = Field(min_length=1, max_length=100)
 
 
 class ImportSummaryResponse(BaseModel):

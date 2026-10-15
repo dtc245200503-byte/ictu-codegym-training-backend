@@ -20,4 +20,15 @@ class ClassSubject(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     class_id = Column(Integer, ForeignKey("classes.class_id"), nullable=False, index=True)
     subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False, index=True)
+    instructor_id = Column(Integer, ForeignKey("users.user_id"), nullable=True)
     __table_args__ = (UniqueConstraint("class_id", "subject_id", name="uq_class_subject"),)
+
+
+class ClassSubjectAssistant(Base):
+    """Teaching assistants assigned to a class subject."""
+    __tablename__ = "class_subject_assistants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    class_subject_id = Column(Integer, ForeignKey("class_subjects.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    __table_args__ = (UniqueConstraint("class_subject_id", "user_id", name="uq_class_subject_assistant"),)

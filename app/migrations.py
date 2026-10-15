@@ -1,6 +1,46 @@
 from sqlalchemy import inspect, text
 
 
+def ensure_class_assignment_schema(engine):
+    """Add subject-level assignments; migrate legacy class teachers only once."""
+    from app.models.subject import ClassSubjectAssistant
+    columns = {column["name"] for column in inspect(engine).get_columns("class_subjects")}
+    if "instructor_id" not in columns:
+        with engine.begin() as connection:
+            if engine.dialect.name == "mysql":
+                connection.execute(text("ALTER TABLE class_subjects ADD COLUMN instructor_id INT NULL, "
+                    "ADD CONSTRAINT fk_class_subject_instructor FOREIGN KEY (instructor_id) REFERENCES users(user_id)"))
+            else:
+                connection.execute(text("ALTER TABLE class_subjects ADD COLUMN instructor_id INTEGER NULL REFERENCES users(user_id)"))
+            connection.execute(text("""UPDATE class_subjects SET instructor_id = (
+                SELECT c.instructor_id FROM classes c WHERE c.class_id = class_subjects.class_id
+                AND EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.role_id = ur.role_id
+                            WHERE ur.user_id = c.instructor_id AND r.role_name IN ('INSTRUCTOR', 'TEACHER'))
+            )"""))
+    ClassSubjectAssistant.__table__.create(bind=engine, checkfirst=True)
+
+
+def seed_class_permissions_and_roles():
+    """Initialize reference data without creating accounts or restoring revoked grants."""
+    from app.database import SessionLocal
+    from app.models.permission import Permission
+    from app.models.role import Role
+    from app.models.role_permission import RolePermission
+    with SessionLocal() as db:
+        if not db.query(Role).first():
+            return  # Fresh database role setup is handled by the existing initializer.
+        if not db.query(Role).filter(Role.role_name.in_(["ASSISTANT", "TA"])).first():
+            maximum = db.query(Role.role_id).order_by(Role.role_id.desc()).first()[0]
+            db.add(Role(role_id=maximum + 1, role_name="ASSISTANT"))
+        if not db.query(Permission).filter_by(permission_name="CLASS_MANAGE").first():
+            permission = Permission(permission_name="CLASS_MANAGE", description="Quản lý lớp học và phân công giảng dạy")
+            db.add(permission)
+            db.flush()
+            for role in db.query(Role).filter(Role.role_name.in_(["ADMIN", "TRAINING_MANAGER", "MANAGER", "ACADEMIC_AFFAIRS"])):
+                db.add(RolePermission(role_id=role.role_id, permission_id=permission.permission_id))
+        db.commit()
+
+
 def ensure_profile_columns(engine):
     """Add nullable profile/avatar columns without changing existing rows."""
     columns = {column["name"] for column in inspect(engine).get_columns("users")}
