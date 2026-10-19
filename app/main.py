@@ -104,3 +104,9 @@ def database_health_check():
     return {
         "database": "connected"
     }
+
+from app.attendance_summary_setup import ensure_attendance_summary_schema, seed_attendance_summary_permission
+ensure_attendance_summary_schema(engine)
+seed_attendance_summary_permission()
+from app.routers.attendance_summary import router as attendance_summary_router
+app.include_router(attendance_summary_router)

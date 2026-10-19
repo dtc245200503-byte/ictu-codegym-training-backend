@@ -4,3 +4,7 @@ from app.models.consultation import ConsultationLead, ConsultationChallenge, Con
 from app.models.subject_lesson import SubjectLesson
 
 from app.models.lead_care import LeadCareLog
+
+from app.models.attendance import StudentClass, ClassSession, SessionAttendance, AttendanceHistory
+from app.models.student_enrollment import StudentEnrollment, StudentEnrollmentHistory
+from app.models.room import Room
