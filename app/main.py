@@ -1,3 +1,4 @@
+from app.attendance_risk_worker import lifespan as risk_lifespan
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -52,6 +53,7 @@ seed_class_permissions_and_roles()
 
 # 2. Khởi tạo FastAPI application
 app = FastAPI(
+    lifespan=risk_lifespan,
     title="Training Management System API",
     version="1.0.0"
 )
@@ -110,3 +112,24 @@ ensure_attendance_summary_schema(engine)
 seed_attendance_summary_permission()
 from app.routers.attendance_summary import router as attendance_summary_router
 app.include_router(attendance_summary_router)
+
+from app.migrations import seed_attendance_permissions, seed_student_management_permission, ensure_timetable_columns, ensure_session_change_columns, ensure_generated_session_columns, ensure_session_room_column, ensure_class_capacity_column, ensure_absence_prefilled_column, ensure_class_opening_schema
+seed_attendance_permissions()
+seed_student_management_permission()
+ensure_timetable_columns(engine)
+ensure_session_change_columns(engine)
+ensure_generated_session_columns(engine)
+ensure_session_room_column(engine)
+ensure_class_capacity_column(engine)
+ensure_absence_prefilled_column(engine)
+ensure_class_opening_schema(engine)
+from app.routers.attendance import router as attendance_router
+app.include_router(attendance_router)
+from app.routers.student_enrollments import router as student_enrollments_router
+app.include_router(student_enrollments_router)
+from app.routers.notifications import router as notifications_router
+app.include_router(notifications_router)
+from app.routers.attendance_risk import router as attendance_risk_router
+app.include_router(attendance_risk_router)
+from app.routers.rooms import router as rooms_router
+app.include_router(rooms_router)

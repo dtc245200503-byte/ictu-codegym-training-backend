@@ -1,3 +1,4 @@
+from app.crud import attendance_risk
 from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -28,4 +29,9 @@ def classes(user: User = Depends(require_staff), db: Session = Depends(get_db)):
 @router.get("/classes/{class_id}")
 def summary(class_id: int, sort: Literal["name", "rate_asc"] = "name", page: int = Query(1, ge=1),
             page_size: int = Query(50, ge=1, le=100), user: User = Depends(require_staff), db: Session = Depends(get_db)):
-    return crud.summary(db, user, class_id, sort, page, page_size)
+    attendance_risk.refresh(db)
+    result = crud.summary(db, user, class_id, sort, page, page_size)
+    flags = {row['student_id']: row for row in attendance_risk.active_flags(db, class_ids=[class_id])}
+    for row in result['students']:
+        row['attendance_risk'] = flags.get(row['student_id'])
+    return result

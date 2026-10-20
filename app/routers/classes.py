@@ -1,3 +1,4 @@
+from app.crud import attendance_risk
 from datetime import date, datetime, timezone
 from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -64,6 +65,7 @@ class ClassSubjectResponse(BaseModel):
 
 
 class ClassResponse(BaseModel):
+    attendance_risks: list[dict] = []
     class_id: int
     class_name: str
     course_id: int | None
@@ -261,6 +263,7 @@ def list_classes(search: str = Query("", max_length=100),
                  course_id: int | None = Query(None, gt=0), page: int = Query(1, ge=1),
                  page_size: int = Query(20, ge=1, le=100),
                  user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    attendance_risk.refresh(db)
     query = db.query(TrainingClass, TrainingProgram, User).outerjoin(
         TrainingProgram, TrainingProgram.course_id == TrainingClass.course_id).outerjoin(
         User, User.user_id == TrainingClass.instructor_id)
@@ -299,9 +302,12 @@ def list_classes(search: str = Query("", max_length=100),
     rows = query.order_by(TrainingClass.class_id.desc()).offset((page-1)*page_size).limit(page_size).all()
     ids = [row[0].class_id for row in rows]
     subjects_map = load_class_subjects_dict(db, ids)
+    risks = {}
+    for flag in attendance_risk.active_flags(db, class_ids=ids):
+        risks.setdefault(flag['class_id'], []).append(flag)
 
     return {"total": total, "page": page, "page_size": page_size, "items": [
-        {"class_id": item.class_id, "class_name": item.class_name, "course_id": item.course_id,
+        {"attendance_risks": risks.get(item.class_id, []), "class_id": item.class_id, "class_name": item.class_name, "course_id": item.course_id,
          "program_code": program.code if program else None, "program_name": program.course_name if program else None,
          "instructor_id": item.instructor_id, "instructor_name": instructor.full_name if instructor else None,
          "start_date": item.start_date, "status": item.status, "subjects": subjects_map.get(item.class_id, [])}

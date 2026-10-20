@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 
 from app.database import Base
 
@@ -24,8 +24,12 @@ class TrainingClass(Base):
 
     class_id = Column(Integer, primary_key=True, autoincrement=True)
     class_name = Column(String(100), nullable=False)
+    class_code = Column(String(50), nullable=True, unique=True)
+    learning_mode = Column(String(20), nullable=True)
+    curriculum_snapshot = Column(Boolean, nullable=False, default=False, server_default="0")
     course_id = Column(Integer, ForeignKey("courses.course_id"), nullable=True)
     instructor_id = Column(Integer, ForeignKey("users.user_id"), nullable=True)
     start_date = Column(Date, nullable=True)
+    max_students = Column(Integer, nullable=True)
     # Legacy classes have no completion data: conservatively treat them as running.
     status = Column(String(20), nullable=False, default="in_progress")
