@@ -1,7 +1,10 @@
 from app.crud import attendance_risk
 from typing import Literal
+from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
+from app.attendance_export import MIME_TYPE, filename, workbook_bytes
 
 from app.core.permissions import require_permission
 from app.crud import attendance_summary as crud
@@ -34,4 +37,19 @@ def summary(class_id: int, sort: Literal["name", "rate_asc"] = "name", page: int
     flags = {row['student_id']: row for row in attendance_risk.active_flags(db, class_ids=[class_id])}
     for row in result['students']:
         row['attendance_risk'] = flags.get(row['student_id'])
+    result["can_export"] = bool(user_roles(db, user) & {"TRAINING_MANAGER", "MANAGER"})
     return result
+
+
+@router.get("/classes/{class_id}/export")
+def export(class_id: int, sort: Literal["name", "rate_asc"] = "name",
+           user: User = Depends(require_staff), db: Session = Depends(get_db)):
+    if not user_roles(db, user) & {"TRAINING_MANAGER", "MANAGER"}:
+        raise HTTPException(403, "Chỉ Quản lý đào tạo được xuất bảng chuyên cần.")
+    result = crud.summary(db, user, class_id, sort, page_size=None)
+    name = filename(result)
+    fallback = f"Chuyen-can_LOP-{class_id}_{result['today'].isoformat()}.xlsx"
+    return Response(workbook_bytes(result), media_type=MIME_TYPE, headers={
+        "Content-Disposition": f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(name, safe='')}",
+        "Cache-Control": "no-store",
+    })

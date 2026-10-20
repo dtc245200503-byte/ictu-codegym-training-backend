@@ -104,8 +104,12 @@ def summary(db, user, class_id, sort, page=1, page_size=50):
     else:
         rows.sort(key=name_key)
     total = len(rows)
+    # Internal exports request the complete, globally sorted matrix in one read.
+    if page_size is None:
+        page, page_size = 1, max(1, total)
     page = min(page, max(1, (total + page_size - 1) // page_size))
     return {"class_id": classroom.class_id, "class_name": classroom.class_name,
+            "class_code": classroom.class_code or f"LOP-{classroom.class_id}",
             "today": day, "sort": sort, "students": rows[(page - 1) * page_size:page * page_size],
             "total": total, "page": page, "page_size": page_size,
             "sessions": [{"session_id": session.session_id, "session_date": session.session_date,
