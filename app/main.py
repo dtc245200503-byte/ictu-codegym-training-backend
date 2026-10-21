@@ -133,3 +133,8 @@ from app.routers.attendance_risk import router as attendance_risk_router
 app.include_router(attendance_risk_router)
 from app.routers.rooms import router as rooms_router
 app.include_router(rooms_router)
+
+from app.assignment_setup import seed_assignment_permissions
+from app.routers.assignments import router as assignments_router
+seed_assignment_permissions()
+app.include_router(assignments_router)

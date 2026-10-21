@@ -9,6 +9,7 @@ from app.database import get_db
 from app.models.user import User
 from app.models.session_change import Notification
 from app.models.absence_request import AbsenceRequest
+from app.models.assignment import AssignmentRecipient
 
 router = APIRouter(prefix="/api/notifications", tags=["Thông báo"])
 
@@ -32,7 +33,11 @@ def inbox(db, user):
         AttendanceRiskNotification.notification_id.label('sort_id'), AttendanceRiskNotification.title.label('title'),
         AttendanceRiskNotification.message.label('message'), AttendanceRiskNotification.created_at.label('created_at'),
         AttendanceRiskNotification.read_at.label('read_at')).filter(AttendanceRiskNotification.recipient_id == user.user_id)
-    combined = changes.union_all(requests, risks).subquery()
+    assignments = db.query((literal('assignment:') + cast(AssignmentRecipient.recipient_id, String)).label('notification_id'),
+        AssignmentRecipient.recipient_id.label('sort_id'), AssignmentRecipient.title.label('title'),
+        AssignmentRecipient.message.label('message'), AssignmentRecipient.created_at.label('created_at'),
+        AssignmentRecipient.read_at.label('read_at')).filter(AssignmentRecipient.student_id == user.user_id)
+    combined = changes.union_all(requests, risks, assignments).subquery()
     return db.query(combined), combined.c
 
 
@@ -50,14 +55,27 @@ def listing(page: int = Query(1, ge=1), unread_only: bool = False, user: User = 
     unread = query.filter(columns.read_at.is_(None)).count()
     if unread_only:
         query = query.filter(columns.read_at.is_(None))
+    rows = query.order_by(columns.created_at.desc(), columns.sort_id.desc(), columns.notification_id).offset((page-1)*20).limit(20).all()
+    assignment_ids = [int(item.notification_id[11:]) for item in rows if item.notification_id.startswith('assignment:')]
+    targets = {f"assignment:{id}": f"/assignments?assignment_id={assignment_id}"
+               for id, assignment_id in db.query(AssignmentRecipient.recipient_id, AssignmentRecipient.assignment_id)
+               .filter(AssignmentRecipient.student_id == user.user_id, AssignmentRecipient.recipient_id.in_(assignment_ids))}
     return {"total": query.count(), "unread": unread,
         "items": [{"notification_id": int(item.notification_id) if item.notification_id.isdigit() else item.notification_id, "title": item.title, "message": item.message,
-                   "created_at": iso(item.created_at), "read_at": iso(item.read_at)}
-                  for item in query.order_by(columns.created_at.desc(), columns.sort_id.desc(), columns.notification_id).offset((page-1)*20).limit(20)]}
+                   "created_at": iso(item.created_at), "read_at": iso(item.read_at), "target_url": targets.get(item.notification_id)}
+                  for item in rows]}
+
 
 
 @router.post("/{notification_id}/read")
 def mark_read(notification_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if notification_id.startswith('assignment:') and notification_id[11:].isdigit():
+        query = db.query(AssignmentRecipient).filter_by(recipient_id=int(notification_id[11:]), student_id=user.user_id)
+        if query.first() is None:
+            raise HTTPException(404, 'Không tìm thấy thông báo.')
+        query.filter_by(read_at=None).update({'read_at': utcnow()}, synchronize_session=False)
+        db.commit()
+        return summary(user, db)
     if notification_id.startswith('risk:') and notification_id[5:].isdigit():
         query = db.query(AttendanceRiskNotification).filter_by(notification_id=int(notification_id[5:]), recipient_id=user.user_id)
         if query.first() is None:
