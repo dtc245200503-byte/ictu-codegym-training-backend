@@ -136,5 +136,7 @@ app.include_router(rooms_router)
 
 from app.assignment_setup import seed_assignment_permissions
 from app.routers.assignments import router as assignments_router
+from app.routers.student_assignments import router as student_assignments_router
 seed_assignment_permissions()
+app.include_router(student_assignments_router)
 app.include_router(assignments_router)

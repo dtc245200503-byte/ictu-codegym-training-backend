@@ -1,5 +1,6 @@
 from app.models.subject import Subject, ClassSubject, ClassSubjectAssistant
 from app.models.assignment import Assignment, AssignmentAttachment, AssignmentRecipient
+from app.models.assignment_progress import AssignmentProgress
 from app.models.lead_assignment import LeadAssignmentHistory
 from app.models.consultation import ConsultationLead, ConsultationChallenge, ConsultationRateBucket
 from app.models.subject_lesson import SubjectLesson
