@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class ScheduleGenerateRequest(BaseModel):
     weekdays: list[int] = Field(min_length=1, max_length=7)
     start_date: date
-    session_count: int = Field(ge=1, le=60)
+    session_count: int = Field(ge=1, le=120)
     start_time: time | None = None
     end_time: time | None = None
     teacher_id: int | None = None
@@ -41,6 +41,7 @@ class ScheduleSessionUpdate(BaseModel):
     teacher_id: int | None = None
     room: str | None = Field(default=None, min_length=1, max_length=80)
     is_cancelled: bool | None = None
+    materials_open_early: bool | None = None
     cancellation_reason: str | None = Field(default=None, max_length=1000)
     allow_conflicts: bool = False
 
@@ -62,7 +63,7 @@ class ScheduleHolidayCreate(BaseModel):
 
 class AttendanceMark(BaseModel):
     student_id: int
-    status: Literal["present", "late", "excused_absent", "unexcused_absent"]
+    status: Literal["present", "late", "excused_absent", "unexcused_absent"] | None
 
 
 class AttendanceBulkUpdate(BaseModel):

@@ -16,6 +16,7 @@ class Course(Base):
         Integer, default=16, server_default="16", nullable=False
     )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    learning_outcomes: Mapped[str | None] = mapped_column(Text, nullable=True)
     prerequisite_id: Mapped[int | None] = mapped_column(
         ForeignKey("courses.id", ondelete="SET NULL"), nullable=True
     )

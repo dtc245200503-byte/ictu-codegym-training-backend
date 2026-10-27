@@ -28,6 +28,18 @@ class LeadCreate(BaseModel):
         return value.strip()
 
 
+class LeadManualCreate(LeadCreate):
+    source: str = Field(default="manual", min_length=1, max_length=80)
+
+    @field_validator("source")
+    @classmethod
+    def clean_source(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Lead source cannot be blank.")
+        return cleaned
+
+
 class LeadUpdate(BaseModel):
     status: Literal[
         "new", "contacted", "consulting", "trial_scheduled", "closed",
@@ -36,6 +48,7 @@ class LeadUpdate(BaseModel):
     notes: str | None = Field(default=None, max_length=3000)
     assigned_to_user_id: int | None = None
     rejection_reason: str | None = Field(default=None, max_length=1000)
+    source: str | None = Field(default=None, max_length=80)
 
     @field_validator("status", mode="before")
     @classmethod
@@ -64,6 +77,29 @@ class LeadUpdate(BaseModel):
     @classmethod
     def strip_rejection_reason(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+    @field_validator("source")
+    @classmethod
+    def clean_optional_source(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Lead source cannot be blank.")
+        return cleaned
+
+
+class LeadBulkAssignment(BaseModel):
+    lead_ids: list[int] = Field(min_length=1, max_length=500)
+    assigned_to_user_id: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_ids(self) -> "LeadBulkAssignment":
+        if any(lead_id < 1 for lead_id in self.lead_ids):
+            raise ValueError("Lead identifiers must be positive.")
+        if len(set(self.lead_ids)) != len(self.lead_ids):
+            raise ValueError("Lead identifiers must be unique.")
+        return self
 
 
 class LeadActivityCreate(BaseModel):

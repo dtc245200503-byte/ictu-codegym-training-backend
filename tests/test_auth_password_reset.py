@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 
+from app.core.config import Settings, settings
 from app.core.security import (
     hash_password,
     hash_password_reset_token,
@@ -14,6 +15,10 @@ from app.models.password_reset_token import PasswordResetToken
 from app.models.user import User
 from fastapi_mail import MessageType
 from app.services import email_service
+
+
+def test_password_reset_default_expiry_is_30_minutes():
+    assert Settings.model_fields["PASSWORD_RESET_TOKEN_EXPIRE_MINUTES"].default == 30
 
 
 def create_reset_test_user(db, **overrides):
@@ -87,7 +92,9 @@ def test_forgot_password_creates_token_and_sends_email(
         if saved_token.expires_at.tzinfo is None
         else saved_token.expires_at
     )
-    assert expiry <= datetime.now(timezone.utc) + timedelta(minutes=15)
+    assert expiry <= datetime.now(timezone.utc) + timedelta(
+        minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
+    )
 
 
 def test_reset_password_success_changes_password_and_revokes_sessions(
@@ -275,6 +282,9 @@ def test_password_reset_email_uses_configured_smtp_and_html_template(monkeypatch
     monkeypatch.setattr(email_service.settings, "MAIL_FROM", "portal@example.com")
     monkeypatch.setattr(email_service.settings, "MAIL_SERVER", "smtp.example.com")
     monkeypatch.setattr(email_service.settings, "MAIL_PORT", 587)
+    monkeypatch.setattr(
+        email_service.settings, "PASSWORD_RESET_TOKEN_EXPIRE_MINUTES", 30
+    )
 
     asyncio.run(
         email_service.send_password_reset_email(
@@ -290,7 +300,7 @@ def test_password_reset_email_uses_configured_smtp_and_html_template(monkeypatch
     assert message.recipients[0].email == "student@example.com"
     assert message.subtype == MessageType.html
     assert "https://portal.example.com/reset-password?token=abc123" in message.body
-    assert "15 phút" in message.body
+    assert "30 phút" in message.body
 
 
 def test_first_login_password_change_uses_auth_endpoint_and_clears_flag(

@@ -51,7 +51,7 @@ async def send_password_reset_email(email: str, reset_link: str) -> None:
             "<h1 style='font-size:22px'>Khôi phục mật khẩu</h1>"
             "<p>Bạn vừa yêu cầu đặt lại mật khẩu tài khoản ICTU Academic Portal.</p>"
             "<p>Nhấn nút bên dưới để tạo mật khẩu mới. Liên kết chỉ có hiệu lực trong "
-            "15 phút.</p>"
+            f"{settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES} phút.</p>"
             f"<p style='margin:28px 0'><a href='{safe_reset_link}' "
             "style='display:inline-block;padding:12px 20px;border-radius:8px;"
             "background:#6553d9;color:white;text-decoration:none'>Đặt lại mật khẩu</a></p>"
@@ -108,5 +108,69 @@ async def send_account_credentials_email(
             "Vui lòng đăng nhập và đổi mật khẩu ngay sau lần đăng nhập đầu tiên."
         ),
         subtype=MessageType.plain,
+    )
+    await FastMail(config).send_message(message)
+
+
+async def send_tuition_due_reminder_email(
+    email: str,
+    *,
+    student_name: str,
+    class_code: str,
+    installment_number: int,
+    due_date: str,
+    remaining_vnd: str,
+    overdue: bool,
+) -> None:
+    """Send a tuition reminder; callers must explicitly enable this channel."""
+    required_settings = (
+        settings.MAIL_USERNAME,
+        settings.MAIL_PASSWORD,
+        settings.MAIL_FROM,
+        settings.MAIL_SERVER,
+    )
+    if not all(value.strip() for value in required_settings):
+        raise RuntimeError("SMTP is not configured for tuition reminders.")
+    config = ConnectionConfig(
+        MAIL_USERNAME=settings.MAIL_USERNAME,
+        MAIL_PASSWORD=settings.MAIL_PASSWORD,
+        MAIL_FROM=settings.MAIL_FROM,
+        MAIL_PORT=settings.MAIL_PORT,
+        MAIL_SERVER=settings.MAIL_SERVER,
+        MAIL_STARTTLS=settings.MAIL_STARTTLS,
+        MAIL_SSL_TLS=settings.MAIL_SSL_TLS,
+        USE_CREDENTIALS=True,
+        VALIDATE_CERTS=True,
+    )
+    safe_name = escape(student_name)
+    safe_class = escape(class_code)
+    subject = "Nhắc học phí quá hạn" if overdue else "Nhắc hạn đóng học phí"
+    message = MessageSchema(
+        subject=f"[ICTU Academic Portal] {subject}",
+        recipients=[email],
+        body=(
+            f"Xin chào {safe_name},\n"
+            f"Lớp {safe_class}, đợt học phí {installment_number} có hạn {due_date}.\n"
+            f"Số dư cần thanh toán: {remaining_vnd} VND."
+        ),
+        subtype=MessageType.plain,
+    )
+    await FastMail(config).send_message(message)
+
+
+async def send_notification_email(email: str, *, title: str, body: str) -> None:
+    """Deliver one already-persisted outbox notification over configured SMTP."""
+    required = (settings.MAIL_USERNAME, settings.MAIL_PASSWORD, settings.MAIL_FROM, settings.MAIL_SERVER)
+    if not all(value.strip() for value in required):
+        raise RuntimeError("SMTP is not configured for notifications.")
+    config = ConnectionConfig(
+        MAIL_USERNAME=settings.MAIL_USERNAME, MAIL_PASSWORD=settings.MAIL_PASSWORD,
+        MAIL_FROM=settings.MAIL_FROM, MAIL_PORT=settings.MAIL_PORT,
+        MAIL_SERVER=settings.MAIL_SERVER, MAIL_STARTTLS=settings.MAIL_STARTTLS,
+        MAIL_SSL_TLS=settings.MAIL_SSL_TLS, USE_CREDENTIALS=True, VALIDATE_CERTS=True,
+    )
+    message = MessageSchema(
+        subject=f"[ICTU Academic Portal] {escape(title)}",
+        recipients=[email], body=escape(body), subtype=MessageType.plain,
     )
     await FastMail(config).send_message(message)

@@ -1,14 +1,18 @@
 from datetime import date, datetime, time
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
     ForeignKey,
+    Integer,
     LargeBinary,
     String,
     Time,
     UniqueConstraint,
+    CheckConstraint,
+    Numeric,
     func,
 )
 from sqlalchemy.dialects.mysql import LONGBLOB
@@ -41,6 +45,7 @@ class AttendanceSession(Base):
         Boolean,
         default=False, server_default="0", nullable=False
     )
+    materials_open_early: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
     cancellation_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     conflict_override: Mapped[bool] = mapped_column(
         Boolean,
@@ -50,7 +55,7 @@ class AttendanceSession(Base):
         DateTime(), server_default=func.current_timestamp(), nullable=False
     )
 
-    training_class: Mapped["TrainingClass"] = relationship()
+    training_class: Mapped["TrainingClass"] = relationship(back_populates="sessions")
     teacher: Mapped["User | None"] = relationship(foreign_keys=[teacher_id])
     lesson: Mapped["CourseLesson | None"] = relationship()
     records: Mapped[list["AttendanceRecord"]] = relationship(
@@ -58,6 +63,24 @@ class AttendanceSession(Base):
     )
 
 
+class AttendanceRiskState(Base):
+    __tablename__ = "attendance_risk_states"
+    __table_args__ = (
+        UniqueConstraint("class_id", "student_id", name="uq_attendance_risk_class_student"),
+        CheckConstraint("absence_threshold_percent BETWEEN 0 AND 100", name="ck_attendance_risk_threshold"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    class_id: Mapped[int] = mapped_column(ForeignKey("training_classes.id", ondelete="CASCADE"), nullable=False, index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    is_at_risk: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    absent_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    completed_session_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    absence_threshold_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
+    activation_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    flagged_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    last_evaluated_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.current_timestamp(), nullable=False)
 class AttendanceRecord(Base):
     __tablename__ = "attendance_records"
     __table_args__ = (
