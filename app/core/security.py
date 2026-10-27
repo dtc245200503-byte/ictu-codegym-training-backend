@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import hashlib
 import secrets
+import string
 
 import jwt
 from pwdlib import PasswordHash
@@ -9,10 +10,28 @@ from pwdlib import PasswordHash
 from app.core.config import settings
 
 
+from functools import lru_cache
+
 password_hash = PasswordHash.recommended()
-DEFAULT_ACCOUNT_PASSWORD = "123456"
 
 
+def generate_temporary_password(length: int = 20) -> str:
+    """Generate a unique, strong password for newly provisioned accounts."""
+    if length < 12:
+        raise ValueError("Temporary passwords must be at least 12 characters long.")
+    alphabet = string.ascii_letters + string.digits + "!@#$%*-_"
+    while True:
+        candidate = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (
+            any(char.islower() for char in candidate)
+            and any(char.isupper() for char in candidate)
+            and any(char.isdigit() for char in candidate)
+            and any(char in "!@#$%*-_" for char in candidate)
+        ):
+            return candidate
+
+
+@lru_cache(maxsize=128)
 def hash_password(password: str) -> str:
     """Hash a plaintext password before storing it."""
     return password_hash.hash(password)

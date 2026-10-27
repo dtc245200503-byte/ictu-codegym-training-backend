@@ -1,21 +1,25 @@
 import base64
 import binascii
 from datetime import date, datetime, time, timedelta, timezone
+from io import BytesIO
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import and_, or_, select
+from openpyxl import Workbook
+from sqlalchemy import String, and_, case, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, joinedload, load_only, selectinload
 
 from app.api.dependencies import get_current_user, require_roles
-from app.core.security import DEFAULT_ACCOUNT_PASSWORD
+from app.api.pagination import page_metadata, set_pagination_headers
 from app.db.session import get_db
 from app.models.audit_log import AuditLog
 from app.models.attendance import (
     AbsenceRequest,
     AttendanceChangeLog,
     AttendanceRecord,
+    AttendanceRiskState,
     AttendanceScheduleHoliday,
     AttendanceSession,
 )
@@ -23,7 +27,11 @@ from app.models.course import Course
 from app.models.course_lesson import CourseLesson
 from app.models.notification import Notification
 from app.models.student_enrollment_history import StudentEnrollmentHistory
+from app.models.study_program import StudyProgram
 from app.models.training_class import ClassEnrollment, TrainingClass
+from app.services.attendance_summary import HO_CHI_MINH, summarize_class_attendance
+from app.services.notification_outbox import enqueue_notification_email
+from app.services.attendance_risk import attendance_warning, refresh_attendance_risk_states
 from app.models.user import User
 from app.schemas.sprint4 import (
     AbsenceRequestCreate,
@@ -75,25 +83,21 @@ def _effective_enrollments(
     enrollments = db.scalars(
         select(ClassEnrollment)
         .options(joinedload(ClassEnrollment.student))
-        .where(ClassEnrollment.class_id == training_class.id)
+        .where(ClassEnrollment.class_id == training_class.id,
+            _effective_enrollment_predicate(session_date))
         .order_by(ClassEnrollment.id)
     ).all()
-    return [
-        enrollment
-        for enrollment in enrollments
-        if (
-            enrollment.enrollment_status == "active"
-            and (
-                enrollment.effective_date is None
-                or enrollment.effective_date <= session_date
-            )
-        )
-        or (
-            enrollment.enrollment_status != "active"
-            and enrollment.effective_date is not None
-            and session_date < enrollment.effective_date
-        )
-    ]
+    return enrollments
+
+
+def _effective_enrollment_predicate(session_date: date):
+    return or_(
+        and_(ClassEnrollment.enrollment_status == "active",
+            or_(ClassEnrollment.effective_date.is_(None),
+                ClassEnrollment.effective_date <= session_date)),
+        and_(ClassEnrollment.enrollment_status != "active",
+            ClassEnrollment.effective_date > session_date),
+    )
 
 
 def _session_teacher(session: AttendanceSession) -> int:
@@ -131,6 +135,7 @@ def _session_payload(session: AttendanceSession) -> dict[str, Any]:
         "lesson_sequence": lesson.sequence if lesson else None,
         "lesson_title": lesson.title if lesson else None,
         "is_cancelled": session.is_cancelled,
+        "materials_open_early": session.materials_open_early,
         "cancellation_reason": session.cancellation_reason,
         "conflict_override": session.conflict_override,
         "has_attendance": bool(session.records),
@@ -251,11 +256,6 @@ def _generate_preview(
         .where(CourseLesson.course_id == training_class.course_id)
         .order_by(CourseLesson.sequence)
     ).all()
-    if len(lessons) < request.session_count:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Syllabus có {len(lessons)} buổi, không đủ {request.session_count} buổi để xếp lịch.",
-        )
     holidays = {
         holiday.holiday_date: holiday.name
         for holiday in db.scalars(
@@ -286,7 +286,7 @@ def _generate_preview(
                 status_code=409,
                 detail=f"Lớp đã có buổi học ngày {current.isoformat()}.",
             )
-        lesson = lessons[len(sessions)]
+        lesson = lessons[len(sessions)] if len(sessions) < len(lessons) else None
         conflicts = _candidate_conflicts(
             db,
             training_class,
@@ -305,9 +305,9 @@ def _generate_preview(
                 "teacher_id": teacher_id,
                 "teacher_name": teacher.full_name,
                 "room": room,
-                "lesson_id": lesson.id,
-                "lesson_sequence": lesson.sequence,
-                "lesson_title": lesson.title,
+                "lesson_id": lesson.id if lesson else None,
+                "lesson_sequence": lesson.sequence if lesson else len(sessions) + 1,
+                "lesson_title": lesson.title if lesson else f"Buổi {len(sessions) + 1}: Chuyên đề & Thực hành",
                 "conflicts": conflicts,
             }
         )
@@ -328,19 +328,22 @@ def _notify_schedule_change(
     recipients = user_ids | {training_class.teacher_id}
     if teacher_id is not None:
         recipients.add(teacher_id)
-    db.add_all(
-        Notification(
+    for user_id in recipients:
+        notification = Notification(
             user_id=user_id,
             class_id=training_class.id,
             title=title,
             message=message,
         )
-        for user_id in recipients
-    )
+        db.add(notification)
+        enqueue_notification_email(db, notification, db.get(User, user_id))
 
 
 @router.get("/schedule/holidays")
 def list_schedule_holidays(
+    response: Response,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     start_date: date | None = None,
     end_date: date | None = None,
     _user: User = Depends(require_roles(*MANAGER_ROLES)),
@@ -351,9 +354,13 @@ def list_schedule_holidays(
         query = query.where(AttendanceScheduleHoliday.holiday_date >= start_date)
     if end_date:
         query = query.where(AttendanceScheduleHoliday.holiday_date <= end_date)
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = db.scalars(query.order_by(AttendanceScheduleHoliday.holiday_date,
+        AttendanceScheduleHoliday.id).offset((page - 1) * page_size).limit(page_size)).all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
     return [
         {"id": item.id, "holiday_date": item.holiday_date.isoformat(), "name": item.name}
-        for item in db.scalars(query.order_by(AttendanceScheduleHoliday.holiday_date)).all()
+        for item in rows
     ]
 
 
@@ -500,6 +507,9 @@ def _schedule_query(db: Session):
 def list_schedule_sessions(
     start_date: date,
     end_date: date,
+    response: Response,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     class_id: int | None = None,
     teacher_id: int | None = None,
     room: str | None = Query(default=None, max_length=80),
@@ -566,16 +576,112 @@ def list_schedule_sessions(
                 ),
             )
         )
+    total = db.scalar(select(func.count()).select_from(
+        query.with_only_columns(AttendanceSession.id).order_by(None).distinct().subquery()
+    )) or 0
+    sessions = db.scalars(query.order_by(AttendanceSession.session_date,
+        AttendanceSession.start_time, AttendanceSession.id)
+        .offset((page - 1) * page_size).limit(page_size)).unique().all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
+    return [_session_payload(session) for session in sessions]
+
+
+@router.get("/schedule/conflicts")
+def list_schedule_conflicts(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    _manager: User = Depends(require_roles(*MANAGER_ROLES)),
+    db: Session = Depends(get_db),
+) -> dict:
+    today = date.today()
+    actual_start = start_date or (today - timedelta(days=30))
+    actual_end = end_date or (today + timedelta(days=60))
+    if actual_end < actual_start:
+        raise HTTPException(status_code=422, detail="end_date must be on or after start_date.")
+    if (actual_end - actual_start).days > 90:
+        raise HTTPException(
+            status_code=422,
+            detail="Conflict checks are limited to a 90-day window; narrow the requested date range.",
+        )
+
+    query = _schedule_query(db).where(
+        AttendanceSession.session_date.between(actual_start, actual_end),
+        AttendanceSession.is_cancelled.is_(False),
+    )
     sessions = db.scalars(
         query.order_by(AttendanceSession.session_date, AttendanceSession.start_time)
     ).unique().all()
-    return [_session_payload(session) for session in sessions]
+
+    conflicts: list[dict[str, Any]] = []
+    sessions_by_date: dict[date, list[AttendanceSession]] = {}
+    for s in sessions:
+        sessions_by_date.setdefault(s.session_date, []).append(s)
+
+    for session_date, day_sessions in sessions_by_date.items():
+        n = len(day_sessions)
+        for i in range(n):
+            s1 = day_sessions[i]
+            t1 = _session_teacher(s1)
+            r1 = _session_room(s1).strip()
+            for j in range(i + 1, n):
+                s2 = day_sessions[j]
+                if s1.class_id == s2.class_id:
+                    continue
+                if s1.start_time < s2.end_time and s1.end_time > s2.start_time:
+                    t2 = _session_teacher(s2)
+                    r2 = _session_room(s2).strip()
+                    teacher_conflict = (t1 == t2)
+                    room_conflict = bool(r1 and r2 and r1.casefold() == r2.casefold())
+                    if teacher_conflict or room_conflict:
+                        conflict_type = (
+                            "both" if (teacher_conflict and room_conflict)
+                            else ("teacher" if teacher_conflict else "room")
+                        )
+                        overridden = bool(s1.conflict_override or s2.conflict_override)
+                        teacher_name = (
+                            s1.teacher.full_name
+                            if s1.teacher
+                            else s1.training_class.teacher.full_name
+                        )
+                        entity_name = (
+                            teacher_name if conflict_type == "teacher"
+                            else (r1 if conflict_type == "room" else f"{teacher_name} & {r1}")
+                        )
+                        conflicts.append({
+                            "id": f"{s1.id}-{s2.id}",
+                            "date": session_date.isoformat(),
+                            "weekday": DAY_NAMES[session_date.weekday()],
+                            "conflict_type": conflict_type,
+                            "teacher_conflict": teacher_conflict,
+                            "room_conflict": room_conflict,
+                            "conflict_entity": entity_name,
+                            "status": "overridden" if overridden else "unresolved",
+                            "severity": "medium" if overridden else "high",
+                            "overlap_time": f"{max(s1.start_time, s2.start_time).strftime('%H:%M')} – {min(s1.end_time, s2.end_time).strftime('%H:%M')}",
+                            "session_1": _session_payload(s1),
+                            "session_2": _session_payload(s2),
+                        })
+
+    return {
+        "start_date": actual_start.isoformat(),
+        "end_date": actual_end.isoformat(),
+        "total_conflicts": len(conflicts),
+        "unresolved_count": sum(1 for c in conflicts if c["status"] == "unresolved"),
+        "overridden_count": sum(1 for c in conflicts if c["status"] == "overridden"),
+        "teacher_conflicts": sum(1 for c in conflicts if c["teacher_conflict"]),
+        "room_conflicts": sum(1 for c in conflicts if c["room_conflict"]),
+        "conflicts": conflicts,
+    }
 
 
 @router.get("/me/schedule")
 def personal_schedule(
+    response: Response,
     start_date: date = Query(default_factory=date.today),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     end_date: date | None = None,
+    class_id: int | None = Query(default=None, ge=1),
     user: User = Depends(require_roles("student")),
     db: Session = Depends(get_db),
 ) -> list[dict]:
@@ -599,15 +705,24 @@ def personal_schedule(
         ),
         AttendanceSession.session_date.between(start_date, actual_end),
     )
-    sessions = db.scalars(
-        query.order_by(AttendanceSession.session_date, AttendanceSession.start_time)
-    ).unique().all()
+    if class_id is not None:
+        query = query.where(AttendanceSession.class_id == class_id)
+    total = db.scalar(select(func.count()).select_from(
+        query.with_only_columns(AttendanceSession.id).order_by(None).distinct().subquery()
+    )) or 0
+    sessions = db.scalars(query.order_by(AttendanceSession.session_date,
+        AttendanceSession.start_time, AttendanceSession.id)
+        .offset((page - 1) * page_size).limit(page_size)).unique().all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
     return [_session_payload(session) for session in sessions]
 
 
 @router.get("/classes/{class_id}/sessions")
 def list_class_sessions(
     class_id: int,
+    response: Response,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     start_date: date | None = None,
     end_date: date | None = None,
     user: User = Depends(get_current_user),
@@ -637,32 +752,43 @@ def list_class_sessions(
         query = query.where(AttendanceSession.session_date >= start_date)
     if end_date:
         query = query.where(AttendanceSession.session_date <= end_date)
+    total = db.scalar(select(func.count()).select_from(
+        query.with_only_columns(AttendanceSession.id).order_by(None).distinct().subquery()
+    )) or 0
+    sessions = db.scalars(query.order_by(AttendanceSession.session_date,
+        AttendanceSession.start_time, AttendanceSession.id)
+        .offset((page - 1) * page_size).limit(page_size)).unique().all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
     return [
         _session_payload(item)
-        for item in db.scalars(
-            query.order_by(AttendanceSession.session_date, AttendanceSession.start_time)
-        ).unique().all()
+        for item in sessions
     ]
 
 
 @router.get("/students/{student_id}/enrollments")
 def list_student_enrollments(
     student_id: int,
+    response: Response,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     _manager: User = Depends(require_roles(*MANAGER_ROLES)),
     db: Session = Depends(get_db),
 ) -> list[dict]:
+    query = select(ClassEnrollment).where(
+        ClassEnrollment.student_id == student_id,
+        ClassEnrollment.enrollment_status == "active",
+    )
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     enrollments = db.scalars(
-        select(ClassEnrollment)
+        query
         .options(
             joinedload(ClassEnrollment.training_class)
             .joinedload(TrainingClass.course)
         )
-        .where(
-            ClassEnrollment.student_id == student_id,
-            ClassEnrollment.enrollment_status == "active",
-        )
         .order_by(ClassEnrollment.id)
+        .offset((page - 1) * page_size).limit(page_size)
     ).all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
     return [
         {
             "class_id": enrollment.class_id,
@@ -672,6 +798,33 @@ def list_student_enrollments(
         }
         for enrollment in enrollments
     ]
+
+
+@router.get("/schedule/sessions/{session_id}")
+def get_schedule_session(
+    session_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    session = db.scalar(
+        _schedule_query(db).where(AttendanceSession.id == session_id)
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy buổi học.")
+    roles = {role.code for role in user.roles}
+    if not roles.intersection(MANAGER_ROLES + ("admissions", "accountant")):
+        if "student" in roles:
+            enrolled = db.scalar(
+                select(ClassEnrollment.id).where(
+                    ClassEnrollment.class_id == session.class_id,
+                    ClassEnrollment.student_id == user.id,
+                )
+            )
+            if not enrolled:
+                raise HTTPException(status_code=403, detail="Bạn không tham gia lớp này.")
+        elif not _has_class_staff_access(user, session.training_class) and session.teacher_id != user.id:
+            raise HTTPException(status_code=403, detail="Bạn không được phân công vào lớp này.")
+    return _session_payload(session)
 
 
 @router.patch("/schedule/sessions/{session_id}")
@@ -755,6 +908,8 @@ def update_schedule_session(
 @router.get("/attendance/sessions/{session_id}")
 def get_session_attendance(
     session_id: int,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     user: User = Depends(require_roles(*STAFF_ROLES)),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -764,22 +919,568 @@ def get_session_attendance(
     if session is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy buổi học.")
     _assert_class_staff_access(user, session.training_class, session)
-    enrollments = _effective_enrollments(db, session.training_class, session.session_date)
+    enrollment_query = select(ClassEnrollment).where(
+        ClassEnrollment.class_id == session.class_id,
+        _effective_enrollment_predicate(session.session_date),
+    )
+    total = db.scalar(select(func.count()).select_from(enrollment_query.subquery())) or 0
+    enrollments = db.scalars(enrollment_query.options(
+        joinedload(ClassEnrollment.student)
+    ).order_by(ClassEnrollment.id).offset((page - 1) * page_size).limit(page_size)).all()
     records_by_student = {record.student_id: record for record in session.records}
     return {
         "session": _session_payload(session),
+        **page_metadata(total=total, page=page, page_size=page_size),
         "students": [
             {
                 "id": enrollment.student_id,
                 "student_code": enrollment.student.student_code or enrollment.student.username,
                 "full_name": enrollment.student.full_name,
-                "status": records_by_student[enrollment.student_id].status
-                if enrollment.student_id in records_by_student
-                else None,
+                "status": (
+                    records_by_student[enrollment.student_id].status
+                    if enrollment.student_id in records_by_student
+                    and records_by_student[enrollment.student_id].status != "not_recorded"
+                    else None
+                ),
             }
             for enrollment in enrollments
         ],
     }
+
+
+@router.get("/classes/{class_id}/attendance/summary")
+def get_class_attendance_summary(
+    class_id: int,
+    q: str = Query(default="", max_length=150),
+    attendance_status: str = Query(
+        default="all",
+        alias="status",
+        pattern="^(all|present|late|excused_absent|unexcused_absent|absent|not_recorded)$",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    sort: str = Query(default="attendance_asc", pattern="^(attendance_asc|attendance_desc)$"),
+    user: User = Depends(require_roles(*STAFF_ROLES)),
+    db: Session = Depends(get_db),
+) -> dict:
+    training_class = db.scalar(
+        select(TrainingClass)
+        .options(
+            load_only(
+                TrainingClass.id,
+                TrainingClass.code,
+                TrainingClass.name,
+                TrainingClass.teacher_id,
+                TrainingClass.assistant_id,
+                TrainingClass.program_id,
+            ),
+            selectinload(TrainingClass.assistants).load_only(User.id),
+        )
+        .where(TrainingClass.id == class_id)
+    )
+    if training_class is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy lớp học.")
+    _assert_class_staff_access(user, training_class)
+
+    local_now = datetime.now(HO_CHI_MINH)
+    eligible_sessions = (
+        select(
+            AttendanceSession.id.label("id"),
+            AttendanceSession.session_date.label("session_date"),
+            AttendanceSession.start_time.label("start_time"),
+            AttendanceSession.end_time.label("end_time"),
+        )
+        .where(
+            AttendanceSession.class_id == class_id,
+            AttendanceSession.is_cancelled.is_(False),
+            or_(
+                AttendanceSession.session_date < local_now.date(),
+                and_(AttendanceSession.session_date == local_now.date(),
+                    AttendanceSession.end_time < local_now.time().replace(tzinfo=None)),
+            ),
+        )
+        .subquery()
+    )
+    sessions = db.execute(select(eligible_sessions).order_by(
+        eligible_sessions.c.session_date, eligible_sessions.c.start_time, eligible_sessions.c.id
+    )).all()
+    session_ids = [row.id for row in sessions]
+    eligible_enrollment = or_(
+        and_(ClassEnrollment.enrollment_status == "active",
+            or_(ClassEnrollment.effective_date.is_(None),
+                ClassEnrollment.effective_date <= eligible_sessions.c.session_date)),
+        and_(ClassEnrollment.enrollment_status != "active",
+            ClassEnrollment.effective_date.is_not(None),
+            eligible_sessions.c.session_date < ClassEnrollment.effective_date),
+    )
+    present_count = func.sum(case((AttendanceRecord.status == "present", 1), else_=0))
+    late_count = func.sum(case((AttendanceRecord.status == "late", 1), else_=0))
+    excused_count = func.sum(case((AttendanceRecord.status == "excused_absent", 1), else_=0))
+    unexcused_count = func.sum(case((AttendanceRecord.status == "unexcused_absent", 1), else_=0))
+    legacy_count = func.sum(case((AttendanceRecord.status == "absent", 1), else_=0))
+    enrollment_stats = (
+        select(
+            ClassEnrollment.id.label("enrollment_id"),
+            ClassEnrollment.student_id.label("student_id"),
+            ClassEnrollment.enrollment_status.label("enrollment_status"),
+            ClassEnrollment.effective_date.label("effective_date"),
+            User.full_name.label("full_name"),
+            func.coalesce(User.student_code, User.username).label("student_code"),
+            func.count(eligible_sessions.c.id).label("total_sessions"),
+            func.coalesce(present_count, 0).label("present_count"),
+            func.coalesce(late_count, 0).label("late_count"),
+            func.coalesce(excused_count, 0).label("excused_absent_count"),
+            func.coalesce(unexcused_count, 0).label("unexcused_absent_count"),
+            func.coalesce(legacy_count, 0).label("legacy_absent_count"),
+        )
+        .join(User, User.id == ClassEnrollment.student_id)
+        .outerjoin(eligible_sessions, and_(eligible_enrollment, eligible_sessions.c.id.is_not(None)))
+        .outerjoin(AttendanceRecord, and_(
+            AttendanceRecord.session_id == eligible_sessions.c.id,
+            AttendanceRecord.student_id == ClassEnrollment.student_id,
+        ))
+        .where(ClassEnrollment.class_id == class_id)
+        .group_by(ClassEnrollment.id, ClassEnrollment.student_id,
+            ClassEnrollment.enrollment_status, ClassEnrollment.effective_date,
+            User.full_name, User.student_code, User.username)
+        .subquery()
+    )
+    included = or_(
+        and_(enrollment_stats.c.enrollment_status == "active",
+            or_(enrollment_stats.c.effective_date.is_(None),
+                enrollment_stats.c.effective_date <= local_now.date())),
+        enrollment_stats.c.total_sessions > 0,
+    )
+    absent_count = (enrollment_stats.c.excused_absent_count
+        + enrollment_stats.c.unexcused_absent_count + enrollment_stats.c.legacy_absent_count)
+    attendance_rate = case(
+        (enrollment_stats.c.total_sessions > 0,
+            func.round((enrollment_stats.c.present_count + enrollment_stats.c.late_count)
+                * 100.0 / func.nullif(enrollment_stats.c.total_sessions, 0), 1)),
+        else_=None,
+    )
+    filtered = select(enrollment_stats, absent_count.label("absent_count"),
+        attendance_rate.label("attendance_rate")).where(included)
+    if q.strip():
+        search = f"%{q.strip()}%"
+        filtered = filtered.where(or_(enrollment_stats.c.full_name.ilike(search),
+            enrollment_stats.c.student_code.ilike(search),
+            cast(enrollment_stats.c.student_id, String).ilike(search)))
+    if attendance_status == "present":
+        filtered = filtered.where(enrollment_stats.c.present_count > 0)
+    elif attendance_status == "late":
+        filtered = filtered.where(enrollment_stats.c.late_count > 0)
+    elif attendance_status == "excused_absent":
+        filtered = filtered.where(enrollment_stats.c.excused_absent_count > 0)
+    elif attendance_status == "unexcused_absent":
+        filtered = filtered.where(enrollment_stats.c.unexcused_absent_count > 0)
+    elif attendance_status == "absent":
+        filtered = filtered.where(enrollment_stats.c.legacy_absent_count > 0)
+    elif attendance_status == "not_recorded":
+        recorded = (enrollment_stats.c.present_count + enrollment_stats.c.late_count
+            + enrollment_stats.c.excused_absent_count + enrollment_stats.c.unexcused_absent_count
+            + enrollment_stats.c.legacy_absent_count)
+        filtered = filtered.where(enrollment_stats.c.total_sessions > recorded)
+    total_students = db.scalar(select(func.count()).select_from(
+        select(enrollment_stats.c.student_id).where(included).subquery())) or 0
+    total_filtered = db.scalar(select(func.count()).select_from(filtered.subquery())) or 0
+    totals_row = db.execute(select(
+        func.coalesce(func.sum(enrollment_stats.c.present_count + enrollment_stats.c.late_count), 0),
+        func.coalesce(func.sum(absent_count), 0),
+        func.coalesce(func.sum(enrollment_stats.c.excused_absent_count), 0),
+        func.coalesce(func.sum(enrollment_stats.c.unexcused_absent_count), 0),
+        func.coalesce(func.sum(enrollment_stats.c.legacy_absent_count), 0),
+        func.coalesce(func.sum(enrollment_stats.c.total_sessions
+            - enrollment_stats.c.present_count - enrollment_stats.c.late_count
+            - enrollment_stats.c.excused_absent_count - enrollment_stats.c.unexcused_absent_count
+            - enrollment_stats.c.legacy_absent_count), 0),
+    ).where(included)).one()
+    if sort == "attendance_desc":
+        sort_rate = attendance_rate.desc()
+    else:
+        sort_rate = attendance_rate.asc()
+    actual_page = page or 1
+    actual_page_size = page_size or max(total_filtered, 1)
+    page_rows = db.execute(filtered.order_by(attendance_rate.is_(None), sort_rate,
+            func.lower(enrollment_stats.c.full_name), enrollment_stats.c.student_id)
+        .offset((actual_page - 1) * actual_page_size).limit(actual_page_size)).all()
+    page_student_ids = [row.student_id for row in page_rows]
+    records = db.execute(select(AttendanceRecord.session_id, AttendanceRecord.student_id,
+            AttendanceRecord.status)
+        .where(AttendanceRecord.session_id.in_(session_ids or [-1]),
+            AttendanceRecord.student_id.in_(page_student_ids or [-1]))).all()
+    record_by_pair = {(row.session_id, row.student_id): row.status for row in records}
+    session_payload = [{"id": row.id, "session_date": row.session_date.isoformat(),
+        "start_time": row.start_time.strftime("%H:%M:%S"),
+        "end_time": row.end_time.strftime("%H:%M:%S")} for row in sessions]
+    program = db.get(StudyProgram, training_class.program_id) if training_class.program_id is not None else None
+    absence_threshold = float(program.absence_threshold_percent) if program is not None else 20.0
+    students = []
+    for row in page_rows:
+        student_cells = {}
+        for session in sessions:
+            active_for_session = (
+                (row.enrollment_status == "active" and
+                    (row.effective_date is None or row.effective_date <= session.session_date))
+                or (row.enrollment_status != "active" and row.effective_date is not None
+                    and session.session_date < row.effective_date)
+            )
+            stored_status = record_by_pair.get((session.id, row.student_id)) if active_for_session else None
+            cell_status = None if stored_status in (None, "not_recorded") else stored_status
+            student_cells[str(session.id)] = {"eligible": active_for_session, "status": cell_status}
+        student_absent = row.absent_count
+        absent_rate = round(student_absent / row.total_sessions * 100, 1) if row.total_sessions else None
+        warning = attendance_warning(student_absent, row.total_sessions, absence_threshold)
+        students.append({
+            "id": row.student_id,
+            "student_code": row.student_code,
+            "full_name": row.full_name,
+            "attendance_by_session": student_cells,
+            "total_sessions": row.total_sessions,
+            "attended_count": row.present_count + row.late_count,
+            "present_count": row.present_count,
+            "late_count": row.late_count,
+            "excused_absent_count": row.excused_absent_count,
+            "unexcused_absent_count": row.unexcused_absent_count,
+            "legacy_absent_count": row.legacy_absent_count,
+            "unrecorded_count": max(0, row.total_sessions - row.present_count - row.late_count
+                - row.excused_absent_count - row.unexcused_absent_count - row.legacy_absent_count),
+            "absent_count": student_absent,
+            "attendance_rate": float(row.attendance_rate) if row.attendance_rate is not None else None,
+            "absence_threshold_percent": absence_threshold,
+            "absence_rate_percent": absent_rate,
+            **warning,
+            "at_risk": warning["warning_status"] in ("at_threshold", "over_threshold"),
+        })
+    response = {
+        "class": {
+            "id": training_class.id,
+            "code": training_class.code,
+            "name": training_class.name,
+        },
+        "sessions": session_payload,
+        "total_students": total_students,
+        "totals": {
+            "attended_count": int(totals_row[0]),
+            "absent_count": int(totals_row[1]),
+            "excused_absent_count": int(totals_row[2]),
+            "unexcused_absent_count": int(totals_row[3]),
+            "legacy_absent_count": int(totals_row[4]),
+            "unrecorded_count": int(totals_row[5]),
+        },
+        "students": students,
+    }
+    if page is not None or page_size is not None:
+        response["pagination"] = page_metadata(
+            total=total_filtered, page=actual_page, page_size=actual_page_size
+        )
+    return response
+
+
+@router.get("/students/me/attendance-history")
+def get_my_attendance_history(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    class_id: int | None = Query(default=None, ge=1),
+    user: User = Depends(require_roles("student")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return only the authenticated student's eligible past attendance."""
+    enrollments = db.scalars(
+        select(ClassEnrollment)
+        .options(
+            joinedload(ClassEnrollment.training_class).joinedload(TrainingClass.course)
+        )
+        .where(
+            ClassEnrollment.student_id == user.id,
+            *([ClassEnrollment.class_id == class_id] if class_id is not None else []),
+        )
+        .order_by(ClassEnrollment.id)
+    ).all()
+    class_ids = {enrollment.class_id for enrollment in enrollments}
+    if not class_ids:
+        return {
+            "items": [],
+            "classes": [],
+            "totals": {"present_count": 0, "late_count": 0, "absent_count": 0, "unrecorded_count": 0, "total_sessions": 0},
+            "attendance_rate": None,
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "pages": 0,
+        }
+
+    sessions = db.scalars(
+        select(AttendanceSession)
+        .options(
+            load_only(
+                AttendanceSession.id,
+                AttendanceSession.class_id,
+                AttendanceSession.session_date,
+                AttendanceSession.start_time,
+                AttendanceSession.end_time,
+                AttendanceSession.is_cancelled,
+            )
+        )
+        .where(AttendanceSession.class_id.in_(class_ids))
+    ).all()
+    session_ids = [session.id for session in sessions]
+    records = (
+        db.scalars(
+            select(AttendanceRecord)
+            .options(
+                load_only(
+                    AttendanceRecord.session_id,
+                    AttendanceRecord.student_id,
+                    AttendanceRecord.status,
+                )
+            )
+            .where(
+                AttendanceRecord.session_id.in_(session_ids),
+                AttendanceRecord.student_id == user.id,
+            )
+        ).all()
+        if session_ids
+        else []
+    )
+    now = datetime.now(timezone.utc)
+    sessions_by_class: dict[int, list[AttendanceSession]] = {}
+    session_by_id = {session.id: session for session in sessions}
+    records_by_class: dict[int, list[AttendanceRecord]] = {}
+    for session in sessions:
+        sessions_by_class.setdefault(session.class_id, []).append(session)
+    for record in records:
+        session = session_by_id.get(record.session_id)
+        if session is not None:
+            records_by_class.setdefault(session.class_id, []).append(record)
+
+    classes: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+    totals = {
+        "present_count": 0,
+        "late_count": 0,
+        "absent_count": 0,
+        "unrecorded_count": 0,
+        "total_sessions": 0,
+    }
+    program_ids = {enrollment.training_class.program_id for enrollment in enrollments
+                   if enrollment.training_class.program_id is not None}
+    program_thresholds = dict(db.execute(
+        select(StudyProgram.id, StudyProgram.absence_threshold_percent)
+        .where(StudyProgram.id.in_(program_ids))
+    ).all()) if program_ids else {}
+    for enrollment in enrollments:
+        training_class = enrollment.training_class
+        class_sessions = sessions_by_class.get(training_class.id, [])
+        summary = summarize_class_attendance(
+            enrollments=[enrollment],
+            sessions=class_sessions,
+            records=records_by_class.get(training_class.id, []),
+            as_of=now,
+        )
+        if not summary.students:
+            continue
+        student = summary.students[0]
+        threshold = float(program_thresholds.get(training_class.program_id, 20))
+        warning = attendance_warning(student.absent_count, student.total_sessions, threshold)
+        classes.append(
+            {
+                "class_id": training_class.id,
+                "class_code": training_class.code,
+                "class_name": training_class.name,
+                "course_name": training_class.course.name,
+                "present_count": student.present_count,
+                "late_count": student.late_count,
+                "absent_count": student.absent_count,
+                "unrecorded_count": student.unrecorded_count,
+                "total_sessions": student.total_sessions,
+                "attendance_rate": student.attendance_rate,
+                "absence_threshold_percent": threshold,
+                **warning,
+            }
+        )
+        totals["present_count"] += student.present_count
+        totals["late_count"] += student.late_count
+        totals["absent_count"] += student.absent_count
+        totals["unrecorded_count"] += student.unrecorded_count
+        totals["total_sessions"] += student.total_sessions
+    history_query = select(AttendanceSession, AttendanceRecord, TrainingClass).join(
+        TrainingClass, TrainingClass.id == AttendanceSession.class_id
+    ).join(ClassEnrollment, ClassEnrollment.class_id == AttendanceSession.class_id).outerjoin(
+        AttendanceRecord, (AttendanceRecord.session_id == AttendanceSession.id)
+        & (AttendanceRecord.student_id == user.id)
+    ).where(AttendanceSession.class_id.in_(class_ids),
+        AttendanceSession.is_cancelled.is_(False),
+        AttendanceSession.session_date < datetime.now(HO_CHI_MINH).date(),
+        ClassEnrollment.student_id == user.id,
+        _effective_enrollment_predicate(AttendanceSession.session_date))
+    total = db.scalar(select(func.count()).select_from(
+        history_query.with_only_columns(AttendanceSession.id).order_by(None).distinct().subquery()
+    )) or 0
+    page_rows = db.execute(history_query.order_by(AttendanceSession.session_date.desc(),
+        AttendanceSession.start_time.desc(), AttendanceSession.id.desc())
+        .offset((page - 1) * page_size).limit(page_size)).all()
+    items = [{"session_id": session.id, "session_date": session.session_date.isoformat(),
+        "start_time": session.start_time.strftime("%H:%M:%S"),
+        "end_time": session.end_time.strftime("%H:%M:%S"),
+        "status": record.status if record and record.status != "not_recorded" else None,
+        "class_id": training_class.id, "class_code": training_class.code,
+        "class_name": training_class.name, "course_name": training_class.course.name}
+        for session, record, training_class in page_rows]
+    classes.sort(key=lambda item: (item["class_code"].casefold(), item["class_id"]))
+    attended_count = totals["present_count"] + totals["late_count"]
+    attendance_rate = (
+        round(attended_count / totals["total_sessions"] * 100, 1)
+        if totals["total_sessions"]
+        else None
+    )
+    return {
+        "items": items,
+        "classes": classes,
+        "totals": totals,
+        "attendance_rate": attendance_rate,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total + page_size - 1) // page_size,
+        "has_previous": page > 1 and total > 0,
+        "has_next": page * page_size < total,
+    }
+
+
+@router.get("/classes/{class_id}/attendance/export")
+def export_class_attendance(
+    class_id: int,
+    user: User = Depends(require_roles(*MANAGER_ROLES)),
+    db: Session = Depends(get_db),
+) -> Response:
+    summary = get_class_attendance_summary(
+        class_id=class_id,
+        q="",
+        attendance_status="all",
+        page=None,
+        page_size=None,
+        sort="attendance_asc",
+        user=user,
+        db=db,
+    )
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Chuyên cần"
+    def excel_text(value: str) -> str:
+        text = str(value)
+        return f"'{text}" if text.lstrip().startswith(("=", "+", "-", "@")) else text
+
+    sheet.append(
+        [
+            excel_text(
+                f"Bảng chuyên cần — {summary['class']['code']} · {summary['class']['name']}"
+            )
+        ]
+    )
+    exported_on = datetime.now(timezone.utc).astimezone(HO_CHI_MINH).date()
+    sheet.append([f"Ngày xuất: {exported_on.isoformat()}"])
+    sheet.append([])
+
+    headers = ["Mã học viên", "Họ tên"]
+    headers.extend(
+        f"{session['session_date']} {session['start_time'][:5]}–{session['end_time'][:5]}"
+        for session in summary["sessions"]
+    )
+    headers.extend(
+        [
+            "Có mặt",
+            "Đi muộn",
+            "Vắng có phép",
+            "Vắng không phép",
+            "Vắng trạng thái cũ",
+            "Chưa ghi nhận",
+            "Tổng vắng",
+            "Tỷ lệ chuyên cần (%)",
+        ]
+    )
+    sheet.append(headers)
+
+    labels = {
+        "present": "Có mặt",
+        "late": "Đi muộn",
+        "excused_absent": "Vắng có phép",
+        "unexcused_absent": "Vắng không phép",
+        "absent": "Vắng trạng thái cũ",
+    }
+    for student in summary["students"]:
+        cells = []
+        for session in summary["sessions"]:
+            cell = student["attendance_by_session"].get(str(session["id"]))
+            if not cell or not cell["eligible"]:
+                cells.append("Không áp dụng")
+            elif cell["status"] is None:
+                cells.append("Chưa ghi nhận")
+            else:
+                cells.append(labels[cell["status"]])
+        sheet.append(
+            [
+                excel_text(student["student_code"] or f"#{student['id']}"),
+                excel_text(student["full_name"]),
+                *cells,
+                student["present_count"],
+                student["late_count"],
+                student["excused_absent_count"],
+                student["unexcused_absent_count"],
+                student["legacy_absent_count"],
+                student["unrecorded_count"],
+                student["absent_count"],
+                student["attendance_rate"],
+            ]
+        )
+
+    last_column = sheet.cell(row=4, column=len(headers)).column_letter
+    sheet.freeze_panes = "C5"
+    sheet.auto_filter.ref = f"A4:{last_column}{sheet.max_row}"
+    for column_cells in sheet.columns:
+        column_letter = column_cells[0].column_letter
+        max_length = max(len(str(cell.value or "")) for cell in column_cells)
+        sheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 32)
+
+    output = BytesIO()
+    workbook.save(output)
+    safe_code = "".join(
+        char if char.isalnum() or char in "-_" else "-"
+        for char in summary["class"]["code"]
+    ).strip("-") or f"class-{class_id}"
+    filename = f"{safe_code}-attendance-{exported_on.isoformat()}.xlsx"
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename, safe='')}"},
+    )
+
+
+@router.get("/students/me/attendance-risk")
+def get_my_attendance_risk(
+    response: Response,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    student: User = Depends(require_roles("student")),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    query = select(AttendanceRiskState, TrainingClass).join(
+        TrainingClass, TrainingClass.id == AttendanceRiskState.class_id
+    ).where(AttendanceRiskState.student_id == student.id,
+            AttendanceRiskState.is_at_risk.is_(True))
+    total = db.scalar(select(func.count()).select_from(
+        query.with_only_columns(AttendanceRiskState.class_id).order_by(None).subquery()
+    )) or 0
+    rows = db.execute(query.order_by(TrainingClass.code, TrainingClass.id)
+        .offset((page - 1) * page_size).limit(page_size)).all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
+    return [{"class_id": training_class.id, "class_code": training_class.code,
+             "class_name": training_class.name, "is_at_risk": state.is_at_risk,
+             "absent_count": state.absent_count,
+             "completed_session_count": state.completed_session_count,
+             "absence_threshold_percent": str(state.absence_threshold_percent),
+             "flagged_at": state.flagged_at.isoformat() if state.flagged_at else None}
+            for state, training_class in rows]
 
 
 @router.put("/attendance/sessions/{session_id}")
@@ -809,8 +1510,25 @@ def mark_session_attendance(
         raise HTTPException(status_code=422, detail="Danh sách có học viên không thuộc buổi học.")
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     records_by_student = {record.student_id: record for record in session.records}
+    updated_count = 0
     for marked in request.records:
         record = records_by_student.get(marked.student_id)
+        if marked.status is None:
+            if record is None:
+                continue
+            db.delete(record)
+            enrollment = db.scalar(
+                select(ClassEnrollment).where(
+                    ClassEnrollment.class_id == session.class_id,
+                    ClassEnrollment.student_id == marked.student_id,
+                )
+            )
+            if enrollment:
+                enrollment.attendance_status = "not_recorded"
+                enrollment.last_attendance_at = None
+            updated_count += 1
+            continue
+
         old_status = record.status if record else None
         if record is None:
             record = AttendanceRecord(
@@ -849,8 +1567,10 @@ def mark_session_attendance(
                 else "not_recorded"
             )
             enrollment.last_attendance_at = now
+        updated_count += 1
+    refresh_attendance_risk_states(db, session.training_class)
     db.commit()
-    return {"session_id": session.id, "updated_count": len(request.records)}
+    return {"session_id": session.id, "updated_count": updated_count}
 
 
 def _absence_payload(request: AbsenceRequest) -> dict:
@@ -926,20 +1646,26 @@ def create_absence_request(
 
 @router.get("/me/absence-requests")
 def list_my_absence_requests(
+    response: Response,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     user: User = Depends(require_roles("student")),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    requests = db.scalars(
-        select(AbsenceRequest)
-        .where(AbsenceRequest.student_id == user.id)
-        .order_by(AbsenceRequest.created_at.desc())
-    ).all()
+    query = select(AbsenceRequest).where(AbsenceRequest.student_id == user.id)
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    requests = db.scalars(query.order_by(AbsenceRequest.created_at.desc(), AbsenceRequest.id.desc())
+        .offset((page - 1) * page_size).limit(page_size)).all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
     return [_absence_payload(item) for item in requests]
 
 
 @router.get("/classes/{class_id}/absence-requests")
 def list_class_absence_requests(
     class_id: int,
+    response: Response,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     user: User = Depends(require_roles(*STAFF_ROLES)),
     db: Session = Depends(get_db),
 ) -> list[dict]:
@@ -967,7 +1693,12 @@ def list_class_absence_requests(
                 status_code=403, detail="Bạn không được phân công vào lớp này."
             )
         query = query.where(AttendanceSession.teacher_id == user.id)
-    requests = db.scalars(query.order_by(AbsenceRequest.created_at.desc())).all()
+    total = db.scalar(select(func.count()).select_from(
+        query.with_only_columns(AbsenceRequest.id).order_by(None).distinct().subquery()
+    )) or 0
+    requests = db.scalars(query.order_by(AbsenceRequest.created_at.desc(), AbsenceRequest.id.desc())
+        .offset((page - 1) * page_size).limit(page_size)).all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
     return [_absence_payload(item) for item in requests]
 
 
@@ -1054,14 +1785,14 @@ def decide_absence_request(
         if enrollment:
             enrollment.attendance_status = "absent"
             enrollment.last_attendance_at = now
-    db.add(
-        Notification(
-            user_id=absence.student_id,
-            class_id=session.class_id,
-            title="Đơn xin vắng đã được xử lý",
-            message=f"{session.training_class.code} · {session.session_date}: {decision.status}. {decision.decision_reason}",
-        )
+    notification = Notification(
+        user_id=absence.student_id,
+        class_id=session.class_id,
+        title="Đơn xin vắng đã được xử lý",
+        message=f"{session.training_class.code} · {session.session_date}: {decision.status}. {decision.decision_reason}",
     )
+    db.add(notification)
+    enqueue_notification_email(db, notification, db.get(User, absence.student_id))
     db.commit()
     db.refresh(absence)
     return _absence_payload(absence)
@@ -1161,14 +1892,17 @@ def process_student_enrollment_change(
 @router.get("/students/{student_id}/enrollment-history")
 def get_student_enrollment_history(
     student_id: int,
+    response: Response,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     _manager: User = Depends(require_roles(*MANAGER_ROLES)),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    history = db.scalars(
-        select(StudentEnrollmentHistory)
-        .where(StudentEnrollmentHistory.student_id == student_id)
-        .order_by(StudentEnrollmentHistory.effective_date.desc(), StudentEnrollmentHistory.id.desc())
-    ).all()
+    query = select(StudentEnrollmentHistory).where(StudentEnrollmentHistory.student_id == student_id)
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    history = db.scalars(query.order_by(StudentEnrollmentHistory.effective_date.desc(),
+        StudentEnrollmentHistory.id.desc()).offset((page - 1) * page_size).limit(page_size)).all()
+    set_pagination_headers(response, total=total, page=page, page_size=page_size)
     return [
         {
             "id": item.id,

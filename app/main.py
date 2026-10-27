@@ -8,6 +8,9 @@ from app.api.routes.management import router as management_router
 from app.api.routes.profile import router as profile_router
 from app.api.routes.leads import router as leads_router
 from app.api.routes.sprint4 import router as sprint4_router
+from app.api.routes.academic import router as academic_router
+from app.api.routes.surveys import router as surveys_router
+from app.api.routes.dashboards import router as dashboards_router
 
 
 app = FastAPI(
@@ -33,6 +36,9 @@ app.include_router(management_router, prefix="/api")
 app.include_router(profile_router, prefix="/api")
 app.include_router(leads_router, prefix="/api")
 app.include_router(sprint4_router, prefix="/api")
+app.include_router(academic_router, prefix="/api")
+app.include_router(surveys_router, prefix="/api")
+app.include_router(dashboards_router, prefix="/api")
 
 
 @app.get("/")

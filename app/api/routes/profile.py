@@ -1,7 +1,10 @@
 import base64
 import binascii
+import warnings
+from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
@@ -13,6 +16,9 @@ from app.schemas.management import AvatarUpload, SelfProfileUpdate
 
 router = APIRouter(tags=["User profile"])
 MAX_AVATAR_BYTES = 2 * 1024 * 1024
+MAX_AVATAR_PIXELS = 40_000_000
+AVATAR_SIZE = 512
+AVATAR_THUMBNAIL_SIZE = 128
 
 
 def _image_content_type(image_data: bytes) -> str | None:
@@ -66,16 +72,22 @@ def update_current_user(
 
 @router.get("/me/avatar")
 def read_current_avatar(
+    variant: str = "original",
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
+    if variant not in {"original", "thumbnail"}:
+        raise HTTPException(status_code=422, detail="variant must be original or thumbnail.")
     avatar = db.get(UserAvatar, current_user.id)
     if avatar is None:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+    image_data = avatar.thumbnail_data if variant == "thumbnail" else avatar.image_data
+    if not image_data:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
     return Response(
-        content=avatar.image_data,
+        content=image_data,
         media_type=avatar.content_type,
-        headers={"Cache-Control": "private, no-store"},
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -98,16 +110,62 @@ def update_current_avatar(
             detail="Chỉ chấp nhận ảnh PNG, JPEG hoặc WebP hợp lệ.",
         )
 
+    expected_format = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}[detected_type]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(image_data)) as source:
+                if source.format != expected_format or getattr(source, "n_frames", 1) != 1:
+                    raise HTTPException(status_code=422, detail="Avatar must be a valid single-frame image matching its content type.")
+                if source.width * source.height > MAX_AVATAR_PIXELS:
+                    raise HTTPException(status_code=413, detail="Avatar image dimensions are too large.")
+                source.load()
+                oriented = ImageOps.exif_transpose(source)
+                width, height = oriented.size
+                if request.crop_size is None:
+                    size = min(width, height)
+                    left, top = (width - size) // 2, (height - size) // 2
+                else:
+                    size = request.crop_size
+                    left, top = request.crop_x or 0, request.crop_y or 0
+                    if left + size > width or top + size > height:
+                        raise HTTPException(status_code=422, detail="Avatar crop coordinates exceed image bounds.")
+                cropped = oriented.crop((left, top, left + size, top + size))
+                cropped = cropped.convert("RGB" if detected_type == "image/jpeg" or "A" not in cropped.getbands() else "RGBA")
+                resampling = getattr(Image, "Resampling", Image).LANCZOS
+                cropped = cropped.resize((AVATAR_SIZE, AVATAR_SIZE), resampling)
+                thumbnail = cropped.resize((AVATAR_THUMBNAIL_SIZE, AVATAR_THUMBNAIL_SIZE), resampling)
+                options = {"format": expected_format}
+                if expected_format == "JPEG":
+                    options.update(quality=88, optimize=True)
+                elif expected_format == "PNG":
+                    options.update(optimize=True)
+                else:
+                    options.update(quality=88, method=4)
+                normalized_buffer, thumbnail_buffer = BytesIO(), BytesIO()
+                cropped.save(normalized_buffer, **options)
+                thumbnail.save(thumbnail_buffer, **options)
+                image_data = normalized_buffer.getvalue()
+                thumbnail_data = thumbnail_buffer.getvalue()
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError, Image.DecompressionBombWarning, ValueError) as error:
+        raise HTTPException(status_code=422, detail="Image content is invalid or unsafe.") from error
+    if len(image_data) > MAX_AVATAR_BYTES:
+        raise HTTPException(status_code=413, detail="Processed avatar exceeds the 2 MiB storage limit.")
+
     avatar = db.get(UserAvatar, current_user.id)
     if avatar is None:
         avatar = UserAvatar(
             user_id=current_user.id,
             image_data=image_data,
+            thumbnail_data=thumbnail_data,
             content_type=detected_type,
         )
         db.add(avatar)
     else:
         avatar.image_data = image_data
+        avatar.thumbnail_data = thumbnail_data
         avatar.content_type = detected_type
     db.commit()
     return {"message": "Ảnh đại diện đã được cập nhật."}

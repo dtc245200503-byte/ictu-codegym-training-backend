@@ -61,12 +61,12 @@ The two program credit totals (126 each) are degree requirements; the ten subjec
 ## Implemented modules
 
 - JWT login, refresh rotation, logout, password reset, change password and account lockout.
-- Initial-admin seed accounts and accounts created through Admin account management or `.xlsx` import must change their password on first login; account management and import use `123456` by default (overridable in the form or optional `password` spreadsheet column). Protected APIs remain unavailable until the password is changed.
-- Password-reset tokens expire after 15 minutes. When SMTP is not configured, the backend logs the reset link for local development.
+- Initial-admin seed accounts and accounts created through Admin account management or `.xlsx` import must change their temporary password on first login; account management and import use a temporary default (overridable in the form or optional `password` spreadsheet column). Protected APIs remain unavailable until the password is changed.
+- Password-reset tokens expire after 30 minutes by default (`PASSWORD_RESET_TOKEN_EXPIRE_MINUTES` can override this). When SMTP is not configured, the backend logs the reset link for local development.
 - Role-protected account search, pagination, profile editing, role assignment, lock/unlock audit history and `.xlsx` import/template download.
 - Self-service profile updates and private PNG/JPEG/WebP avatar storage (maximum 2 MB per avatar).
 - Public consultation requests persisted as leads, with an Admissions/Admin Kanban pipeline, searchable status columns, drag-and-drop stage updates, and an append-only care journal.
-- Qualified leads can be converted once into a student account and student profile with a generated student code, the initial `123456` password, and mandatory first-login password change.
+- Qualified leads can be converted once into a student account and student profile with a generated student code, a temporary password, and mandatory first-login password change.
 - Searchable student-profile directory for Training Managers and Admissions, including program, contact, and identity updates.
 - Course catalog with credits, departments, prerequisites and safe deactivation.
 - Eight seeded roles: Admin, Training Manager, Admissions, Accountant, Instructor, TA, Student and Guest.

@@ -1,9 +1,12 @@
 from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Literal
+import re
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
-from app.core.security import DEFAULT_ACCOUNT_PASSWORD
+from app.core.security import generate_temporary_password
 
 
 class ChangePasswordRequest(BaseModel):
@@ -32,7 +35,7 @@ class AccountCreate(BaseModel):
     )
     roles: list[str] | None = Field(default=None, min_length=1, max_length=8)
     password: str = Field(
-        default=DEFAULT_ACCOUNT_PASSWORD, min_length=1, max_length=128
+        default_factory=generate_temporary_password, min_length=1, max_length=128
     )
     student_code: str | None = Field(default=None, max_length=50)
     phone: str | None = Field(default=None, max_length=30)
@@ -59,6 +62,8 @@ class AccountUpdate(BaseModel):
 
 
 class SelfProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     full_name: str | None = Field(default=None, min_length=1, max_length=150)
     phone: str | None = Field(default=None, max_length=30)
     birth_date: date | None = None
@@ -68,6 +73,13 @@ class SelfProfileUpdate(BaseModel):
     @classmethod
     def strip_profile_text(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+    @field_validator("phone")
+    @classmethod
+    def validate_vietnamese_phone(cls, value: str | None) -> str | None:
+        if value and not re.fullmatch(r"(?:0\d{9}|\+84\d{9})", value):
+            raise ValueError("Sá»‘ Ä‘iá»‡n thoáº¡i pháº£i theo Ä‘á»‹nh dáº¡ng Viá»‡t Nam.")
+        return value
 
     @field_validator("full_name")
     @classmethod
@@ -80,6 +92,16 @@ class SelfProfileUpdate(BaseModel):
 class AvatarUpload(BaseModel):
     content_type: Literal["image/jpeg", "image/png", "image/webp"]
     data_base64: str = Field(min_length=1, max_length=2_800_000)
+    crop_x: int | None = Field(default=None, ge=0)
+    crop_y: int | None = Field(default=None, ge=0)
+    crop_size: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_crop(self) -> "AvatarUpload":
+        supplied = (self.crop_x is not None, self.crop_y is not None, self.crop_size is not None)
+        if any(supplied) and not all(supplied):
+            raise ValueError("crop_x, crop_y, and crop_size must be supplied together.")
+        return self
 
 
 class AccountStatusRequest(BaseModel):
@@ -158,6 +180,7 @@ class CourseCreate(BaseModel):
     credits: int = Field(ge=1, le=30)
     session_count: int = Field(default=16, ge=1, le=500)
     description: str | None = None
+    learning_outcomes: str | None = Field(default=None, max_length=10000)
     prerequisite_id: int | None = None
 
 
@@ -167,6 +190,7 @@ class CourseUpdate(BaseModel):
     credits: int | None = Field(default=None, ge=1, le=30)
     session_count: int | None = Field(default=None, ge=1, le=500)
     description: str | None = None
+    learning_outcomes: str | None = Field(default=None, max_length=10000)
     prerequisite_id: int | None = None
     is_active: bool | None = None
 
@@ -174,23 +198,147 @@ class CourseUpdate(BaseModel):
 class StudyProgramCourse(BaseModel):
     course_id: int
     prerequisite_course_id: int | None = None
+    weight: Decimal = Field(default=Decimal("0"), ge=0, max_digits=8, decimal_places=2)
 
 
 class StudyProgramCoursesUpdate(BaseModel):
     courses: list[StudyProgramCourse]
 
 
+class StudyProgramCreate(BaseModel):
+    code: str = Field(min_length=2, max_length=30, pattern="^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2, max_length=150)
+    degree_level: str = Field(default="Đại học", min_length=2, max_length=30)
+    total_credits: int = Field(ge=1, le=1000)
+    duration_semesters: int = Field(default=8, ge=1, le=40)
+    description: str | None = Field(default=None, max_length=10000)
+    standard_tuition_vnd: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=0)
+
+
+class StudyProgramUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=150)
+    degree_level: str | None = Field(default=None, min_length=2, max_length=30)
+    total_credits: int | None = Field(default=None, ge=1, le=1000)
+    duration_semesters: int | None = Field(default=None, ge=1, le=40)
+    description: str | None = Field(default=None, max_length=10000)
+    is_active: bool | None = None
+    standard_tuition_vnd: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=0)
+
+    @model_validator(mode="after")
+    def require_update(self) -> "StudyProgramUpdate":
+        if not self.model_fields_set:
+            raise ValueError("At least one field must be supplied.")
+        if "standard_tuition_vnd" in self.model_fields_set and self.standard_tuition_vnd is None:
+            raise ValueError("Standard tuition cannot be null.")
+        return self
+
+
 class StudyProgramSubjectCreate(BaseModel):
     subject_id: int
+    weight: Decimal = Field(default=Decimal("0"), ge=0, max_digits=8, decimal_places=2)
 
 
 class StudyProgramSubject(BaseModel):
     subject_id: int
     prerequisite_subject_id: int | None = None
+    weight: Decimal = Field(default=Decimal("0"), ge=0, max_digits=8, decimal_places=2)
 
 
 class StudyProgramSubjectsUpdate(BaseModel):
     subjects: list[StudyProgramSubject]
+
+
+class ProgramFeeScheduleCreate(BaseModel):
+    amount_vnd: Decimal = Field(ge=0, max_digits=18, decimal_places=0)
+    valid_from: date
+    valid_to: date | None = None
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "ProgramFeeScheduleCreate":
+        if self.valid_to is not None and self.valid_to < self.valid_from:
+            raise ValueError("Ngày kết thúc hiệu lực phải sau hoặc bằng ngày bắt đầu.")
+        return self
+
+
+class TuitionInstallmentInput(BaseModel):
+    amount_vnd: Decimal = Field(gt=0, max_digits=18, decimal_places=0)
+    due_date: date
+
+
+class TuitionPlanBatchCreate(BaseModel):
+    class_id: int = Field(ge=1)
+    fee_schedule_id: int = Field(ge=1)
+    applied_on: date
+    installments: list[TuitionInstallmentInput] = Field(min_length=1, max_length=24)
+
+    @model_validator(mode="after")
+    def validate_installments(self) -> "TuitionPlanBatchCreate":
+        if sum((item.amount_vnd for item in self.installments), Decimal("0")) <= 0:
+            raise ValueError("Tổng kế hoạch phải lớn hơn 0 VND.")
+        if [item.due_date for item in self.installments] != sorted(
+            item.due_date for item in self.installments
+        ):
+            raise ValueError("Ngày đến hạn các đợt phải theo thứ tự tăng dần.")
+        return self
+
+
+class TuitionPaymentCreate(BaseModel):
+    amount_vnd: Decimal = Field(gt=0, max_digits=18, decimal_places=0)
+    method: Literal["cash", "bank_transfer"]
+    paid_on: date
+    idempotency_key: str = Field(min_length=8, max_length=100)
+    note: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def strip_idempotency_key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Idempotency key không được để trống.")
+        return value
+
+    @field_validator("note")
+    @classmethod
+    def strip_payment_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class TuitionPaymentReversalCreate(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=100)
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("idempotency_key", "reason")
+    @classmethod
+    def strip_reversal_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Giá trị không được để trống.")
+        return value
+
+
+class TuitionDiscountCreate(BaseModel):
+    kind: Literal["fixed", "percent"]
+    value: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def strip_discount_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Discount reason cannot be blank.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_discount_value(self):
+        if self.kind == "percent" and self.value > Decimal("100"):
+            raise ValueError("Discount percentage cannot exceed 100%.")
+        if self.kind == "fixed" and self.value != self.value.to_integral_value():
+            raise ValueError("Fixed discount must be an integer VND amount.")
+        return self
 
 
 class TrainingClassCreate(BaseModel):
@@ -198,6 +346,8 @@ class TrainingClassCreate(BaseModel):
     name: str = Field(min_length=2, max_length=150)
     course_id: int
     program_id: int | None = None
+    planned_start_date: date | None = None
+    delivery_mode: Literal["onsite", "online", "hybrid"] = "onsite"
     teacher_id: int
     assistant_id: int | None = None
     assistant_ids: list[int] = Field(default_factory=list, max_length=100)
@@ -220,6 +370,9 @@ class TrainingClassCreate(BaseModel):
 class TrainingClassUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=150)
     course_id: int | None = None
+    program_id: int | None = Field(default=None, ge=1)
+    planned_start_date: date | None = None
+    delivery_mode: Literal["onsite", "online", "hybrid"] | None = None
     teacher_id: int | None = None
     assistant_id: int | None = None
     assistant_ids: list[int] | None = Field(default=None, max_length=100)
@@ -241,6 +394,14 @@ class TrainingClassUpdate(BaseModel):
 class EnrollmentRequest(BaseModel):
     student_ids: list[int] = Field(min_length=1, max_length=500)
 
+    @model_validator(mode="after")
+    def require_unique_students(self) -> "EnrollmentRequest":
+        if any(student_id < 1 for student_id in self.student_ids):
+            raise ValueError("Student identifiers must be positive.")
+        if len(set(self.student_ids)) != len(self.student_ids):
+            raise ValueError("A student can only appear once in a bulk enrollment request.")
+        return self
+
 
 class StudentProfileUpdate(BaseModel):
     full_name: str = Field(min_length=1, max_length=150)
@@ -248,6 +409,16 @@ class StudentProfileUpdate(BaseModel):
     birth_date: date | None = None
     address: str | None = Field(default=None, max_length=255)
     study_program: str | None = Field(default=None, max_length=150)
+    entry_level: str | None = Field(default=None, max_length=150)
+    notes: str | None = Field(default=None, max_length=3000)
+
+    @field_validator("full_name", "phone", "address", "study_program", "entry_level", "notes")
+    @classmethod
+    def normalize_student_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
 
 
 class ClassroomCreate(BaseModel):
@@ -255,11 +426,33 @@ class ClassroomCreate(BaseModel):
     capacity: int = Field(ge=1, le=1000)
     online_url: str | None = Field(default=None, max_length=500)
 
+    @field_validator("online_url")
+    @classmethod
+    def require_secure_online_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip()
+        parsed = urlsplit(normalized)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("Online classroom links must use HTTPS and include a host.")
+        return normalized
+
 
 class ClassroomUpdate(BaseModel):
     code: str | None = Field(default=None, min_length=1, max_length=80)
     capacity: int | None = Field(default=None, ge=1, le=1000)
     online_url: str | None = Field(default=None, max_length=500)
+
+    @field_validator("online_url")
+    @classmethod
+    def require_secure_online_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return value
+        normalized = value.strip()
+        parsed = urlsplit(normalized)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("Online classroom links must use HTTPS and include a host.")
+        return normalized
 
 
 class EnrollmentStatusUpdate(BaseModel):
@@ -279,3 +472,150 @@ class AssignmentCreate(BaseModel):
     title: str = Field(min_length=1, max_length=150)
     description: str | None = Field(default=None, max_length=5000)
     due_at: datetime | None = None
+    max_score: Decimal | None = Field(
+        default=None, gt=0, max_digits=18, decimal_places=2
+    )
+    status: Literal["draft", "published"] = "published"
+    session_id: int | None = Field(default=None, ge=1)
+    grade_component_key: str | None = Field(default=None, min_length=1, max_length=50, pattern="^[a-zA-Z][a-zA-Z0-9_-]*$")
+    late_submission_policy: Literal["BLOCK_LATE", "ALLOW_LATE"] = "BLOCK_LATE"
+
+
+class AssignmentReworkRequestCreate(BaseModel):
+    feedback: str = Field(min_length=1, max_length=5000)
+    due_at: datetime
+
+    @field_validator("feedback")
+    @classmethod
+    def nonblank_feedback(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Rework feedback is required.")
+        return value.strip()
+
+
+class ClassReminderPreferenceUpdate(BaseModel):
+    class_reminder_opt_out: bool
+
+
+class SessionMaterialsVisibilityUpdate(BaseModel):
+    materials_open_early: bool
+
+
+class ProgramAttendancePolicyUpdate(BaseModel):
+    absence_threshold_percent: Decimal = Field(ge=0, le=100, max_digits=5, decimal_places=2)
+
+
+class AnnouncementCreate(BaseModel):
+    class_ids: list[int] = Field(min_length=1, max_length=100)
+    title: str = Field(min_length=1, max_length=150)
+    body: str = Field(min_length=1, max_length=10000)
+
+    @model_validator(mode="after")
+    def normalize_and_validate(self):
+        self.title = self.title.strip()
+        self.body = self.body.strip()
+        if not self.title or not self.body:
+            raise ValueError("Announcement title and body are required.")
+        if any(class_id < 1 for class_id in self.class_ids):
+            raise ValueError("Class identifiers must be positive.")
+        if len(set(self.class_ids)) != len(self.class_ids):
+            raise ValueError("Class identifiers must be unique.")
+        return self
+
+
+class SessionLearningLinkCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=150)
+    url: AnyHttpUrl
+
+    @model_validator(mode="after")
+    def validate_external_link(self):
+        self.title = self.title.strip()
+        if not self.title:
+            raise ValueError("Link title is required.")
+        if self.url.scheme != "https" or self.url.username is not None or self.url.password is not None:
+            raise ValueError("External learning links must use HTTPS and cannot contain credentials.")
+        return self
+
+
+class GradePolicyComponentInput(BaseModel):
+    key: str = Field(min_length=1, max_length=50, pattern="^[a-zA-Z][a-zA-Z0-9_-]*$")
+    name: str = Field(min_length=1, max_length=100)
+    weight: Decimal = Field(gt=0, le=100, max_digits=5, decimal_places=2)
+    required: bool = True
+
+
+class GradePolicyCreate(BaseModel):
+    program_id: int = Field(ge=1)
+    course_id: int = Field(ge=1)
+    class_id: int | None = Field(default=None, ge=1)
+    components: list[GradePolicyComponentInput] = Field(min_length=1, max_length=20)
+    pass_score: Decimal = Field(ge=0, le=100, max_digits=5, decimal_places=2)
+    critical_component_key: str | None = Field(default=None, max_length=50)
+    critical_score: Decimal | None = Field(default=None, ge=0, le=100, max_digits=5, decimal_places=2)
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+        keys = [component.key for component in self.components]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Grade component keys must be unique.")
+        if sum((component.weight for component in self.components), Decimal("0")) != Decimal("100"):
+            raise ValueError("Grade component weights must sum to 100%.")
+        if (self.critical_component_key is None) != (self.critical_score is None):
+            raise ValueError("Critical component and threshold must be configured together.")
+        if self.critical_component_key is not None and self.critical_component_key not in keys:
+            raise ValueError("Critical component must exist in the configured components.")
+        return self
+
+
+class GradeReopenRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def trim_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A reopen reason is required.")
+        return value.strip()
+
+
+class AssignmentSubmissionCreate(BaseModel):
+    repository_url: AnyHttpUrl
+
+    @field_validator("repository_url")
+    @classmethod
+    def require_https_repository(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        if value.scheme != "https" or value.username is not None or value.password is not None:
+            raise ValueError("Liên kết bài nộp phải dùng HTTPS và không chứa thông tin đăng nhập.")
+        return value
+
+
+class AssignmentGradeCreate(BaseModel):
+    submission_id: int = Field(ge=1)
+    score: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+    feedback: str | None = Field(default=None, max_length=5000)
+    internal_comment: str | None = Field(default=None, max_length=5000)
+    rubric_scores: list[dict] | None = Field(default=None, max_length=30)
+
+
+class RubricCriterionInput(BaseModel):
+    title: str = Field(min_length=1, max_length=150)
+    description: str | None = Field(default=None, max_length=1000)
+    weight: Decimal = Field(gt=0, le=100, max_digits=5, decimal_places=2)
+
+
+class RubricTemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=150)
+    description: str | None = Field(default=None, max_length=2000)
+    criteria: list[RubricCriterionInput] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="after")
+    def weights_must_total_100(self):
+        if sum((item.weight for item in self.criteria), Decimal("0")) != Decimal("100"):
+            raise ValueError("Tổng trọng số rubric phải bằng 100%.")
+        return self
+
+
+class RubricScoreInput(BaseModel):
+    criterion_id: int = Field(ge=1)
+    score_percent: Decimal = Field(ge=0, le=100, max_digits=5, decimal_places=2)
+    comment: str | None = Field(default=None, max_length=2000)
